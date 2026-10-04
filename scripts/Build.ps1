@@ -1,11 +1,14 @@
 [CmdletBinding()]
-param([ValidateSet('Debug', 'Release')][string]$Configuration = 'Release')
+param([ValidateSet('Debug', 'Release')][string]$Configuration = 'Release', [switch]$CodeOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'Workspace-Safety.psm1') -Force
 $layout = Get-WorkspaceLayout
-Assert-NoGameRunning -RequireDesktopVisibility:$false
+if (-not $CodeOnly) { Assert-NoGameRunning -RequireDesktopVisibility:$false }
+# Code-only builds use a separate destination and never replace a running game
+# bridge or the normal controller. No game or desktop automation is started.
+$taskBuildRoot = if ($CodeOnly) { Join-Path $layout.Runtime 'build-code-only' } else { $layout.Build }
 if (-not (Test-Path -LiteralPath (Join-Path $layout.Game 'Terraria.exe') -PathType Leaf)) {
     throw 'Prepare and verify the isolated game copy before building.'
 }
@@ -40,7 +43,7 @@ foreach ($name in $projects) {
 }
 
 New-SafeDirectory -Path $layout.Packages -Root $layout.Runtime
-New-SafeDirectory -Path $layout.Build -Root $layout.Runtime
+New-SafeDirectory -Path $taskBuildRoot -Root $layout.Runtime
 New-SafeDirectory -Path (Join-Path $layout.Runtime 'logs') -Root $layout.Runtime
 $configFile = Join-Path $layout.Runtime 'nuget.offline.config'
 Assert-WithinRoot -Path $configFile -Root $layout.Runtime
@@ -59,7 +62,7 @@ $configText = @"
 $attempt = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 $logPath = Join-Path $layout.Runtime "logs/build-$attempt.log"
 $resultPath = Join-Path $layout.Runtime "logs/build-$attempt.json"
-$results = [ordered]@{ StartedUtc = [DateTime]::UtcNow.ToString('o'); Configuration = $Configuration; DecisionMode = 'rules'; GameStarted = $false; Results = @(); Status = 'building' }
+$results = [ordered]@{ StartedUtc = [DateTime]::UtcNow.ToString('o'); Configuration = $Configuration; DecisionMode = 'rules'; GameStarted = $false; CodeOnly = [bool]$CodeOnly; BuildRoot = $taskBuildRoot; Results = @(); Status = 'building' }
 $properties = @('-p:AutomaticallyUseReferenceAssemblyPackages=false', '-p:NuGetAudit=false',
     "-p:FrameworkPathOverride=$framework", "-p:TerrariaInstallPath=$($layout.Game)", "-p:XnaAssemblyRoot=$xnaRoot")
 
@@ -72,9 +75,9 @@ function Invoke-LoggedDotnet {
 function Enable-OwnHostLargeAddressAware {
     # Only our fixed build output is editable. Terraria.exe and all DLLs remain
     # byte-for-byte unchanged. The original game's x86 PE already has this bit.
-    $hostRoot = [IO.Path]::GetFullPath((Join-Path $layout.Build 'AgentHost'))
+    $hostRoot = [IO.Path]::GetFullPath((Join-Path $taskBuildRoot 'AgentHost'))
     $hostPath = [IO.Path]::GetFullPath((Join-Path $hostRoot 'TerrariaAgent.Host.exe'))
-    Assert-WithinRoot -Path $hostRoot -Root $layout.Build
+    Assert-WithinRoot -Path $hostRoot -Root $taskBuildRoot
     Assert-WithinRoot -Path $hostPath -Root $hostRoot
     Assert-NoReparsePath -Path $hostPath
     if (-not (Test-Path -LiteralPath $hostPath -PathType Leaf)) { throw 'The own Host executable is missing after compilation.' }
@@ -121,11 +124,11 @@ function Enable-OwnHostLargeAddressAware {
 
 try {
     foreach ($name in $projects) {
-        Assert-NoGameRunning -RequireDesktopVisibility:$false
+        if (-not $CodeOnly) { Assert-NoGameRunning -RequireDesktopVisibility:$false }
         $projectFile = Join-Path $layout.Project "src/$name/$name.csproj"
         Write-Output "Restoring $name from the reviewed local package feed only."
         Invoke-LoggedDotnet -Arguments (@('restore', $projectFile, '--configfile', $configFile, '--packages', $layout.Packages) + $properties)
-        $destination = Join-Path $layout.Build $name
+        $destination = Join-Path $taskBuildRoot $name
         New-SafeDirectory -Path $destination -Root $layout.Runtime
         Write-Output "Building $name without package restore or launching any game."
         Invoke-LoggedDotnet -Arguments (@('build', $projectFile, '--no-restore', '-c', $Configuration, '-o', $destination) + $properties)

@@ -9,6 +9,10 @@ using TerrariaAgent.Protocol;
 
 namespace TerrariaAgent.Bridge
 {
+    // Startup may serialize this authorization with its own STOP-file lock.
+    // The callback must use only LeaseGate/files, never live Terraria objects.
+    public delegate bool OperatorArmHandler(AgentRequest request, out string reason);
+
     public sealed class TransportStatistics
     {
         public long AcceptedConnections { get; set; }
@@ -32,6 +36,7 @@ namespace TerrariaAgent.Bridge
         private readonly string _runId;
         private readonly string _logDirectory;
         private readonly Action<string, string> _diagnostic;
+        private readonly OperatorArmHandler _operatorArmHandler;
         private readonly HashSet<TcpClient> _clients = new HashSet<TcpClient>();
         private readonly Dictionary<string, long> _diagnosticLast = new Dictionary<string, long>();
         private TcpListener _listener;
@@ -48,7 +53,7 @@ namespace TerrariaAgent.Bridge
         private long _protocolErrors;
 
         public LocalBridgeServer(LeaseGate gate, string token, string runId, string logDirectory,
-            Action<string, string> diagnostic = null)
+            Action<string, string> diagnostic = null, OperatorArmHandler operatorArmHandler = null)
         {
             if (gate == null) throw new ArgumentNullException("gate");
             if (string.IsNullOrEmpty(token)) throw new ArgumentException("Authentication token is required.", "token");
@@ -57,6 +62,7 @@ namespace TerrariaAgent.Bridge
             _runId = runId ?? "";
             _logDirectory = logDirectory ?? "";
             _diagnostic = diagnostic;
+            _operatorArmHandler = operatorArmHandler;
         }
 
         public int Start()
@@ -197,6 +203,13 @@ namespace TerrariaAgent.Bridge
                                 Send(stream, Reply("arm", accepted ? "ok" : "rejected", reason, sessionId, request.Sequence));
                                 Emit("arm_result", reason);
                                 break;
+                            case "operator_arm":
+                                accepted = _operatorArmHandler == null
+                                    ? _gate.ExplicitOperatorArm(request, out reason)
+                                    : _operatorArmHandler(request, out reason);
+                                Send(stream, Reply("operator_arm", accepted ? "ok" : "rejected", reason, sessionId, request.Sequence));
+                                Emit("operator_arm_result", reason);
+                                break;
                             case "action":
                                 accepted = _gate.TryApplyAction(request, receivedAtMs, out reason);
                                 if (accepted) Interlocked.Increment(ref _actionsAccepted);
@@ -272,6 +285,7 @@ namespace TerrariaAgent.Bridge
                 observation.Reason = lease.Reason;
                 observation.LeaseInputs = lease.Inputs.Copy();
                 observation.CanArm = lease.ArmPermitted;
+                observation.CanOperatorArm = lease.CanOperatorArm;
             }
             return new AgentReply
             {
@@ -298,9 +312,11 @@ namespace TerrariaAgent.Bridge
                 VelocityX = value.VelocityX, VelocityY = value.VelocityY,
                 Health = value.Health, MaxHealth = value.MaxHealth, Dead = value.Dead,
                 Menu = value.Menu, TextInput = value.TextInput, ControlState = value.ControlState,
+                GamePaused = value.GamePaused, OptionsOpen = value.OptionsOpen,
                 Reason = value.Reason, Inputs = value.Inputs == null ? new InputState() : value.Inputs.Copy(),
                 LeaseInputs = value.LeaseInputs == null ? new InputState() : value.LeaseInputs.Copy(),
-                GameTick = value.GameTick, MonotonicMs = value.MonotonicMs, CanArm = value.CanArm
+                GameTick = value.GameTick, MonotonicMs = value.MonotonicMs, CanArm = value.CanArm,
+                CanOperatorArm = value.CanOperatorArm, Gameplay = value.Gameplay == null ? null : value.Gameplay.Copy()
             };
         }
 

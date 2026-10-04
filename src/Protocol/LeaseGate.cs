@@ -24,6 +24,7 @@ namespace TerrariaAgent.Protocol
         public bool ArmPermitted { get; set; }
         public bool Connected { get; set; }
         public long ControlEpoch { get; set; }
+        public bool CanOperatorArm { get; set; }
     }
 
     // This only validates control ownership and leases. It never touches game objects.
@@ -32,6 +33,7 @@ namespace TerrariaAgent.Protocol
     {
         private readonly object _sync = new object();
         private readonly Func<long> _now;
+        private readonly bool _allowGameplayActions;
         private readonly Dictionary<long, long> _observations = new Dictionary<long, long>();
         private readonly Queue<long> _observationOrder = new Queue<long>();
         private string _sessionId;
@@ -41,6 +43,7 @@ namespace TerrariaAgent.Protocol
         private bool _menu = true;
         private bool _textInput;
         private bool _armPermitted;
+        private bool _initialOperatorArmAvailable;
         private long _controlEpoch;
         private long _lastSequence;
         private long _lastObservationSequence;
@@ -49,9 +52,11 @@ namespace TerrariaAgent.Protocol
         private string _reason = "manual_default";
         private InputState _inputs = new InputState();
 
-        public LeaseGate(Func<long> nowMs = null)
+        public LeaseGate(Func<long> nowMs = null, bool allowInitialOperatorArm = false, bool allowGameplayActions = false)
         {
             _now = nowMs ?? (() => MonotonicClock.NowMs);
+            _initialOperatorArmAvailable = allowInitialOperatorArm;
+            _allowGameplayActions = allowGameplayActions;
         }
 
         // Called by the authenticated transport owner, never by an unvalidated packet.
@@ -100,6 +105,11 @@ namespace TerrariaAgent.Protocol
                 _dead = dead;
                 _menu = menu;
                 _textInput = textInput;
+                // Menu initialization and an unarmed focus/pause transition are
+                // temporary readiness checks. A real death or leaving a world
+                // must permanently revoke the explicitly enabled first start.
+                if ((dead && !menu && !string.IsNullOrEmpty(worldId)) || (menu && previouslyHadWorld))
+                    _initialOperatorArmAvailable = false;
                 if (changed)
                 {
                     _observations.Clear();
@@ -145,6 +155,7 @@ namespace TerrariaAgent.Protocol
                     observedAtMs < 0 || observedAtMs > now || now - observedAtMs > 500 ||
                     _state == ControlState.Agent || _armPermitted || UnsafeContextLocked() != null) return false;
                 _armPermitted = true;
+                _initialOperatorArmAvailable = false;
                 ++_controlEpoch; // Consume the gesture as well as the later arm request.
                 return true;
             }
@@ -162,10 +173,38 @@ namespace TerrariaAgent.Protocol
                 if (!_armPermitted) { reason = "human_arm_required"; return false; }
                 if (_state == ControlState.Agent) { reason = "already_armed"; return false; }
                 _armPermitted = false;
+                _initialOperatorArmAvailable = false;
                 _lastSequence = request.Sequence;
                 _state = ControlState.Agent;
                 ++_controlEpoch;
                 _reason = "explicitly_armed";
+                _inputs = new InputState();
+                _expiresAtMs = now + ProtocolLimits.MaxActionTtlMs;
+                reason = _reason;
+                return true;
+            }
+        }
+
+        // Enabled only by an explicit Host launch option. This is a one-shot
+        // operator start, not a way to recover from a previous safety stop.
+        public bool ExplicitOperatorArm(AgentRequest request, out string reason)
+        {
+            lock (_sync)
+            {
+                long now = _now();
+                ExpireLocked(now);
+                if (request == null || !IsOwnerLocked(request.SessionId))
+                { reason = "wrong_session"; return false; }
+                bool available = _initialOperatorArmAvailable;
+                _initialOperatorArmAvailable = false;
+                if (available) ++_controlEpoch; // A failed owner attempt is spent too.
+                if (!ValidateRequestLocked(request, "operator_arm", now, out reason)) return false;
+                if (!available || _state != ControlState.Manual || _armPermitted)
+                { reason = "initial_operator_arm_unavailable"; return false; }
+                _lastSequence = request.Sequence;
+                _state = ControlState.Agent;
+                ++_controlEpoch;
+                _reason = "explicitly_operator_armed";
                 _inputs = new InputState();
                 _expiresAtMs = now + ProtocolLimits.MaxActionTtlMs;
                 reason = _reason;
@@ -191,9 +230,22 @@ namespace TerrariaAgent.Protocol
                     return RejectAndLatchLocked("expired_queued_action", out reason);
                 if (request.Left && request.Right)
                     return RejectAndLatchLocked("conflicting_directions", out reason);
+                bool gameplayRequest = request.UseItem || request.CraftWorkBench || request.SelectedSlot != -1 ||
+                    request.AimTileX != -1 || request.AimTileY != -1;
+                if (gameplayRequest && !_allowGameplayActions)
+                    return RejectAndLatchLocked("gameplay_actions_disabled", out reason);
+                if (request.SelectedSlot < -1 || request.SelectedSlot > 49 || request.AimTileX < -1 || request.AimTileY < -1 ||
+                    request.AimTileX > 32767 || request.AimTileY > 32767 ||
+                    ((request.AimTileX == -1) != (request.AimTileY == -1)) ||
+                    (request.UseItem && (request.SelectedSlot < 0 || request.AimTileX < 0)) ||
+                    (request.CraftWorkBench && (request.UseItem || request.Left || request.Right || request.Jump ||
+                        request.SelectedSlot != -1 || request.AimTileX != -1)))
+                    return RejectAndLatchLocked("invalid_gameplay_action", out reason);
                 _lastSequence = request.Sequence;
                 _expiresAtMs = receivedAtMs + request.TtlMs;
-                _inputs = new InputState { Left = request.Left, Right = request.Right, Jump = request.Jump };
+                _inputs = new InputState { Left = request.Left, Right = request.Right, Jump = request.Jump,
+                    UseItem = request.UseItem, SelectedSlot = request.SelectedSlot, AimTileX = request.AimTileX,
+                    AimTileY = request.AimTileY, CraftWorkBench = request.CraftWorkBench };
                 _reason = "action_active";
                 reason = _reason;
                 return true;
@@ -217,6 +269,7 @@ namespace TerrariaAgent.Protocol
         {
             lock (_sync)
             {
+                if (_connected || !string.IsNullOrEmpty(_worldId)) _initialOperatorArmAvailable = false;
                 _inputs = new InputState();
                 _expiresAtMs = 0;
                 _armPermitted = false;
@@ -235,6 +288,25 @@ namespace TerrariaAgent.Protocol
             }
         }
 
+        // Game-thread commit boundary for a one-shot normal game transaction.
+        // A stop that wins this lock prevents execution. A transaction already
+        // running finishes before stop can take ownership; it cannot be retried.
+        public bool TryExecuteCurrent(string sessionId, string worldId, long sequence, Action execute, out string reason)
+        {
+            if (execute == null) throw new ArgumentNullException("execute");
+            lock (_sync)
+            {
+                ExpireLocked(_now());
+                if (!IsOwnerLocked(sessionId) || _state != ControlState.Agent ||
+                    !string.Equals(worldId, _worldId, StringComparison.Ordinal) || _lastSequence != sequence)
+                { reason = "action_revoked_before_execution"; return false; }
+                execute();
+                ExpireLocked(_now());
+                reason = "action_executed";
+                return true;
+            }
+        }
+
         public LeaseSnapshot Snapshot()
         {
             lock (_sync)
@@ -246,6 +318,8 @@ namespace TerrariaAgent.Protocol
                     LastSequence = _lastSequence, ExpiresAtMs = _expiresAtMs,
                     ArmPermitted = _armPermitted,
                     Connected = _connected, ControlEpoch = _controlEpoch,
+                    CanOperatorArm = _initialOperatorArmAvailable && _connected && _state == ControlState.Manual &&
+                        !_armPermitted && UnsafeContextLocked() == null,
                     Inputs = _state == ControlState.Agent ? _inputs.Copy() : new InputState()
                 };
             }
@@ -297,6 +371,7 @@ namespace TerrariaAgent.Protocol
 
         private void LatchLocked(string reason)
         {
+            _initialOperatorArmAvailable = false;
             ++_controlEpoch;
             _inputs = new InputState();
             _expiresAtMs = 0;

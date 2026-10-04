@@ -1,6 +1,8 @@
 # Terraria Agent 环境检查
 
-检查日期为 2026 年 10 月 4 日，时区 Asia/Shanghai。以下是文件、目录、工具和官方来源检查的结果；尚未启动 Terraria 或桥接，也没有游戏验收成绩。用户已选择原版 1.4.5.8 加轻量桥接，tModLoader 的检查仅保留为备选路线资料。
+本页是首次环境检查的历史快照，非当前状态；当前实机结果见 [VALIDATION.md](VALIDATION.md)。
+
+初查日期为 2026 年 10 月 4 日，时区 Asia/Shanghai。以下记录初查时的文件、目录、工具和官方来源结果，当时尚未启动 Terraria 或桥接，也没有游戏验收成绩。用户已选择原版 1.4.5.8 加轻量桥接，tModLoader 的检查仅保留为备选路线资料。
 
 ## 本机发现
 
@@ -20,7 +22,7 @@
 
 ## tModLoader 版本与官方 API
 
-本节是备选资料，其中 ModPlayer/ModSystem 与 tmlsavedirectory 仅适用于 tModLoader，不能应用到当前原版桥接。当前候选 Core、加载器与安全边界见 [源码安全审查](SECURITY_REVIEW.md)，空间见 [磁盘预算](DISK_BUDGET.md)。
+本节是初查时的备选资料，其中 ModPlayer/ModSystem 与 tmlsavedirectory 仅适用于 tModLoader，不能应用到当前原版桥接。初查候选 Core、加载器与安全边界见 [源码安全审查](SECURITY_REVIEW.md)，当前自有接口见 [GAME_API.md](GAME_API.md)，空间见 [磁盘预算](DISK_BUDGET.md)。
 
 候选 stable release 为 [v2026.08.3.0](https://github.com/tModLoader/tModLoader/releases/tag/v2026.08.3.0)，发布于 2026 年 10 月 1 日，属于 Terraria 1.4.4 基线。官方的 [1.4.5 移植跟踪](https://github.com/tModLoader/tModLoader/issues/5070) 说明版本过渡情况。候选版本不等于本机安装版本，安装之后必须重新锁定并复核。
 
@@ -37,6 +39,6 @@ public virtual void PostUpdateEverything()
 
 官方 [命令行参数](https://github.com/tModLoader/tModLoader/wiki/Command-Line#tmlsavedirectory-pathtosavedirectoryfolder) 支持 `-tmlsavedirectory <独立绝对目录>`，与 `-savedirectory` 的目录追加行为不同。实际 SavePath、云端目录影响与存档隔离仍需启动后验证。
 
-## 尚未验证
+## 初查时尚未验证
 
-目前没有完成桥接编译、游戏启动、输入控制、停止/接管、连续游戏录屏、备份校验或 A/B/C/D 中的任何实机验收。下一阶段先锁定原版加载器与桥接的构建和依赖，再验证 A；如果实机操作不可用，将及时记录具体阻塞，不能以编译成功代替游戏验证。
+初查时尚未完成桥接编译、游戏启动、输入控制、停止/接管、连续游戏录屏、备份校验或 A/B/C/D 的实机验收。当时拟先锁定原版加载器与桥接的构建和依赖，再验证 A；这些历史空缺不代表当前仍未完成，最新结果见 VALIDATION。编译成功始终不能代替游戏验证。

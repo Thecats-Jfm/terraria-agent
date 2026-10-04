@@ -23,6 +23,7 @@ namespace TerrariaAgent.Controller
             string logDirectory = null;
             bool success = false;
             string reason = "not_started";
+            string controlAuthorization = "observation_only";
             int permissionWaitMs = 15000;
             long advancingObservations = 0;
             var tasks = new List<object>();
@@ -31,8 +32,15 @@ namespace TerrariaAgent.Controller
             {
                 var options = Parse(args);
                 _mode = options.ContainsKey("mode") ? options["mode"] : "observe";
-                if (_mode != "observe" && _mode != "stage-a" && _mode != "disconnect-test" && _mode != "expiry-test")
-                    throw new ArgumentException("Mode must be observe, stage-a, disconnect-test or expiry-test.");
+                if (_mode != "observe" && _mode != "stage-a" && _mode != "stage-b" && _mode != "disconnect-test" && _mode != "expiry-test" &&
+                    _mode != "manual-test" && _mode != "emergency-test")
+                    throw new ArgumentException("Mode must be observe, stage-a, stage-b, disconnect-test, expiry-test, manual-test or emergency-test.");
+                bool initialStart = options.ContainsKey("initial-start");
+                if (initialStart && _mode == "observe")
+                    throw new ArgumentException("--initial-start requires an action mode and explicit --arm; observe cannot request control.");
+                if (_mode != "observe" && !options.ContainsKey("arm"))
+                    throw new ArgumentException("Action tests require explicit --arm. Use --initial-start only for the enabled run's one initial control attempt.");
+                if (_mode != "observe") controlAuthorization = initialStart ? "initial_explicit_start" : "human_hotkey";
                 permissionWaitMs = options.ContainsKey("permission-wait-ms") ? int.Parse(options["permission-wait-ms"]) : 15000;
                 if (permissionWaitMs < 1000 || permissionWaitMs > 60000)
                     throw new ArgumentException("Permission wait must be 1000..60000 milliseconds.");
@@ -88,14 +96,24 @@ namespace TerrariaAgent.Controller
                 }
                 else
                 {
-                    if (!options.ContainsKey("arm")) throw new ArgumentException("Action tests require an explicit --arm and the in-game human arm hotkey.");
-                    Console.WriteLine("In the game, press Ctrl+Shift+Insert to grant one control attempt. Permission wait budget: " +
-                        (permissionWaitMs / 1000.0) + " seconds.");
-                    OwnObservation initial = WaitForPermission(client, permissionWaitMs);
+                    OwnObservation initial;
+                    if (initialStart)
+                    {
+                        Console.WriteLine("Explicit initial start: waiting for fresh safe-world observations and this run's one initial permission. Wait budget: " +
+                            (permissionWaitMs / 1000.0) + " seconds.");
+                        initial = WaitForReady(client, permissionWaitMs, connectedObservation);
+                    }
+                    else
+                    {
+                        Console.WriteLine("In the game, press Ctrl+Shift+Insert to grant one control attempt. Permission wait budget: " +
+                            (permissionWaitMs / 1000.0) + " seconds.");
+                        initial = WaitForPermission(client, permissionWaitMs);
+                    }
                     // Exactly one arm request. No retry, reconnect-and-rearm or model
                     // loop can reclaim control after the human stops the agent.
-                    client.Arm(initial);
-                    Record("armed", "one explicit attempt", initial);
+                    if (initialStart) client.OperatorArm(initial);
+                    else client.Arm(initial);
+                    Record("armed", "one explicit attempt; controlAuthorization=" + controlAuthorization, initial);
                     if (_mode == "stage-a")
                     {
                         tasks.Add(MoveRight(client));
@@ -104,6 +122,26 @@ namespace TerrariaAgent.Controller
                         tasks.Add(StopNormally(client));
                         success = true;
                         reason = "basic_actions_complete_safety_matrix_still_separate";
+                    }
+                    else if (_mode == "stage-b")
+                    {
+                        try
+                        {
+                            foreach (StageBTaskResult task in StageB.Run(client, () => _cancelled, Record)) tasks.Add(task);
+                        }
+                        catch (StageBFailure error)
+                        {
+                            foreach (StageBTaskResult task in error.Results) tasks.Add(task);
+                            throw;
+                        }
+                        success = true;
+                        reason = "tree_pickup_normal_craft_and_placement_observed";
+                    }
+                    else if (_mode == "manual-test" || _mode == "emergency-test")
+                    {
+                        tasks.Add(HumanStopTest(client, tasks));
+                        success = true;
+                        reason = _mode + "_observed";
                     }
                     else
                     {
@@ -152,8 +190,10 @@ namespace TerrariaAgent.Controller
                 if (logDirectory != null)
                 {
                     string report = JsonSerializer.Serialize(new { mode = _mode, decisionMode = "rules", success,
-                        reason, actions = _actionCount, elapsedMs = timer.ElapsedMilliseconds, permissionWaitMs, advancingObservations, tasks,
-                        scope = "This report covers this game connection only; compilation and this subset do not establish all of stage A.",
+                        controlAuthorization, reason, actions = _actionCount, elapsedMs = timer.ElapsedMilliseconds, permissionWaitMs, advancingObservations, tasks,
+                        scope = _mode == "stage-b" ?
+                            "This report covers only the observed tree/resource/workbench task in this game connection; it does not establish later progression or Boss success." :
+                            "This report covers this game connection only; compilation and this subset do not establish all of stage A.",
                         recordingValidated = false }, new JsonSerializerOptions { WriteIndented = true });
                     File.WriteAllText(Path.Combine(logDirectory, "result-" + _mode + "-" + DateTime.UtcNow.ToString("HHmmss") + ".json"), report);
                 }
@@ -172,6 +212,34 @@ namespace TerrariaAgent.Controller
                 Thread.Sleep(50);
             }
             throw new InvalidOperationException("human_arm_or_ready_world_timeout");
+        }
+
+        private static OwnObservation WaitForReady(BridgeClient client, int timeoutMs, OwnObservation connectedObservation)
+        {
+            var timer = Stopwatch.StartNew();
+            OwnObservation previous = ValidObservation(connectedObservation) ? connectedObservation : null;
+            while (timer.ElapsedMilliseconds < timeoutMs)
+            {
+                CheckCancellation();
+                long requestedAt = timer.ElapsedMilliseconds;
+                OwnObservation observation = client.Observe();
+                // Bridge monotonic time is process-local. Require an observed
+                // advancing tuple in this live connection instead of comparing
+                // the bridge's clock with the controller's clock.
+                bool freshResponse = timer.ElapsedMilliseconds - requestedAt <= ProtocolLimits.MaxObservationAgeMs;
+                if (ValidObservation(observation))
+                {
+                    bool advancingInWorld = previous != null && Ready(previous) &&
+                        string.Equals(previous.WorldId, observation.WorldId, StringComparison.Ordinal) &&
+                        observation.Sequence > previous.Sequence && observation.GameTick > previous.GameTick &&
+                        observation.MonotonicMs > previous.MonotonicMs;
+                    if (freshResponse && advancingInWorld && Ready(observation) && observation.Health >= 25 && observation.CanOperatorArm)
+                        return observation;
+                    previous = observation;
+                }
+                Thread.Sleep(50);
+            }
+            throw new InvalidOperationException("initial_start_or_ready_world_timeout");
         }
 
         private static object MoveRight(BridgeClient client)
@@ -263,6 +331,135 @@ namespace TerrariaAgent.Controller
             throw new InvalidOperationException("stop:actual_release_not_observed_within_budget");
         }
 
+        private static object HumanStopTest(BridgeClient client, List<object> tasks)
+        {
+            OwnObservation before = RequireActive(client.Observe());
+            var movementTimer = Stopwatch.StartNew();
+            OwnObservation moving = Hold(client, false, true, false, 500);
+            if (!NewerObservation(moving, before) || moving.Inputs == null || !moving.Inputs.Right || moving.X - before.X < 8)
+                throw new InvalidOperationException("stop_test:no_fresh_actual_movement_before_trigger");
+            tasks.Add(new { skill = "beforemovement", status = "success", reason = "fresh_actual_right_and_position_changed",
+                actualRightObserved = true, deltaX = moving.X - before.X, elapsedMs = movementTimer.ElapsedMilliseconds,
+                startSequence = before.Sequence, endSequence = moving.Sequence, startGameTick = before.GameTick, endGameTick = moving.GameTick });
+            string instruction = _mode == "manual-test" ? "press and release one movement key in the game" : "press and release Ctrl+Shift+Backspace in the game";
+            Record("takeover_ready", "30s bounded movement renewal; turn at +/-64px from start; " + instruction + "; no rearm", moving);
+            Console.WriteLine("takeover_ready: " + _mode + "; " + instruction + "; window=30s; bounded local movement; no rearm.");
+            var timer = Stopwatch.StartNew();
+            OwnObservation current = moving;
+            long lastAdvanceAt = 0;
+            long stoppedAt = -1;
+            long correctReasonAt = -1;
+            int samples = 0;
+            int releaseSamples = 0;
+            int renewals = 0;
+            int turns = 0;
+            bool right = true;
+            bool rejectedAction = false;
+            while (stoppedAt < 0 ? timer.ElapsedMilliseconds < 30000 : timer.ElapsedMilliseconds - stoppedAt < 1000)
+            {
+                CheckCancellation();
+                var cycle = Stopwatch.StartNew();
+                if (stoppedAt < 0)
+                {
+                    if (timer.ElapsedMilliseconds - lastAdvanceAt > ProtocolLimits.MaxObservationAgeMs)
+                        throw new InvalidOperationException("stop_test:observation_stalled");
+                    // Turn at +/-64px, leaving 96px for sampling latency and
+                    // vanilla deceleration before the unchanged +/-160px bound.
+                    // No teleport or position write.
+                    if (Math.Abs(current.X - before.X) > 160)
+                        throw new InvalidOperationException("stop_test:local_movement_bound_exceeded");
+                    if ((right && current.X - before.X >= 64) || (!right && current.X - before.X <= -64))
+                    { right = !right; ++turns; }
+                    try
+                    {
+                        // The arm was sent once by Main. A rejection racing with
+                        // takeover permits observation only, never another action.
+                        OwnObservation acknowledged = client.Action(current, !right, right, false);
+                        ++renewals;
+                        if (acknowledged != null && acknowledged.ControlState != "Agent")
+                        {
+                            if (!ExpectedHumanStop(acknowledged) && !EmergencyModifierTransition(acknowledged)) RequireActive(acknowledged);
+                            stoppedAt = timer.ElapsedMilliseconds;
+                        }
+                    }
+                    catch (InvalidOperationException error) when (error.Message == "request_rejected:not_armed")
+                    { rejectedAction = true; stoppedAt = timer.ElapsedMilliseconds; }
+                }
+                int remaining = 50 - (int)cycle.ElapsedMilliseconds;
+                if (remaining > 0) Thread.Sleep(remaining);
+                CheckCancellation();
+                long requestedAt = timer.ElapsedMilliseconds;
+                OwnObservation observation = client.Observe();
+                ++samples;
+                if (stoppedAt >= 0) ++releaseSamples;
+                Record("takeover_check", stoppedAt < 0 ? "bounded local movement renewal" : "observation only; no renewal or rearm", observation);
+                if (timer.ElapsedMilliseconds - requestedAt > ProtocolLimits.MaxObservationAgeMs || !ValidObservation(observation))
+                    throw new InvalidOperationException("stop_test:missing_or_old_observation");
+                if (!Ready(observation) || observation.WorldId != moving.WorldId)
+                    throw new InvalidOperationException("stop_test:interrupted_by_world_death_menu_or_text_input");
+                if (observation.Health < 25) throw new InvalidOperationException("unsafe:low_health");
+                if (observation.Sequence < current.Sequence || observation.GameTick < current.GameTick || observation.MonotonicMs < current.MonotonicMs)
+                    throw new InvalidOperationException("stop_test:observation_regressed");
+                if (NewerObservation(observation, current)) lastAdvanceAt = timer.ElapsedMilliseconds;
+                current = observation;
+                if (ExpectedHumanStop(observation))
+                {
+                    if (stoppedAt < 0) stoppedAt = timer.ElapsedMilliseconds;
+                    if (correctReasonAt < 0)
+                    {
+                        correctReasonAt = timer.ElapsedMilliseconds;
+                        Record("takeover_trigger_observed", observation.Reason + "; no more action renewal", observation);
+                    }
+                    if (NewerObservation(observation, moving) && observation.Inputs != null && !Any(observation.Inputs))
+                    {
+                        Record("takeover_release_observed", "fresh actual game input flags released", observation);
+                        return new { skill = _mode, status = "success", reason = observation.Reason, actualInputsReleased = true,
+                            controlState = observation.ControlState, samples, releaseSamples, renewals, turns, rejectedAction,
+                            firstStopObservationMs = correctReasonAt, observedReleaseAfterStopUpperBoundMs = timer.ElapsedMilliseconds - correctReasonAt,
+                            elapsedMs = timer.ElapsedMilliseconds, startSequence = moving.Sequence, endSequence = observation.Sequence,
+                            startGameTick = moving.GameTick, endGameTick = observation.GameTick,
+                            exactDelayEvidence = "Observed delay includes sampling; correlate bridge takeover and actual_input_release events." };
+                    }
+                }
+                else if (EmergencyModifierTransition(observation))
+                {
+                    // Ctrl/Shift can revoke Agent before the full emergency
+                    // chord is delivered. Stop renewing immediately, then require
+                    // the real emergency reason within the same 1s release budget.
+                    if (stoppedAt < 0) stoppedAt = timer.ElapsedMilliseconds;
+                }
+                else if (stoppedAt >= 0)
+                    throw new InvalidOperationException("control_lost:" + observation.Reason);
+                else RequireActive(observation);
+            }
+            string failure = stoppedAt < 0 ? "human_trigger_timeout_30s" : correctReasonAt < 0 ?
+                "expected_human_stop_reason_not_observed_1s" : "actual_inputs_not_released_1s";
+            tasks.Add(new { skill = _mode, status = "failure", reason = failure, samples, releaseSamples, renewals, turns,
+                rejectedAction, observedStopReason = current.Reason, elapsedMs = timer.ElapsedMilliseconds });
+            throw new InvalidOperationException("stop_test:" + failure);
+        }
+
+        private static bool ExpectedHumanStop(OwnObservation observation)
+        {
+            if (observation == null) return false;
+            if (_mode == "emergency-test") return observation.ControlState == "LatchedStop" &&
+                (observation.Reason == "emergency_window_hotkey" || observation.Reason == "emergency_hotkey");
+            return observation.ControlState == "Manual" && (observation.Reason == "physical_window_key" ||
+                observation.Reason == "physical_movement_or_jump" || observation.Reason == "physical_keyboard_input");
+        }
+
+        private static bool EmergencyModifierTransition(OwnObservation observation)
+        {
+            return _mode == "emergency-test" && observation != null && observation.ControlState == "Manual" &&
+                observation.Reason == "physical_window_key";
+        }
+
+        private static bool NewerObservation(OwnObservation sample, OwnObservation before)
+        {
+            return ValidObservation(sample) && sample.Sequence > before.Sequence && sample.GameTick > before.GameTick &&
+                sample.MonotonicMs > before.MonotonicMs;
+        }
+
         private static OwnObservation RequireActive(OwnObservation observation)
         {
             CheckCancellation();
@@ -280,7 +477,7 @@ namespace TerrariaAgent.Controller
         {
             return observation != null && observation.Sequence > 0 && observation.GameTick > 0 && observation.MonotonicMs >= 0;
         }
-        private static bool Any(InputState input) { return input != null && (input.Left || input.Right || input.Jump); }
+        private static bool Any(InputState input) { return input != null && (input.Left || input.Right || input.Jump || input.UseItem); }
         private static void CheckCancellation() { if (_cancelled) throw new OperationCanceledException("cancelled"); }
         private static void Record(string name, string detail, OwnObservation observation)
         {
@@ -295,7 +492,7 @@ namespace TerrariaAgent.Controller
                 string option = arguments[i];
                 if (!option.StartsWith("--", StringComparison.Ordinal)) throw new ArgumentException("Expected an option.");
                 string key = option.Substring(2);
-                if (key == "arm") result.Add(key, "true");
+                if (key == "arm" || key == "initial-start") result.Add(key, "true");
                 else
                 {
                     if (++i >= arguments.Length) throw new ArgumentException("Missing value for " + option);
@@ -305,7 +502,7 @@ namespace TerrariaAgent.Controller
             return result;
         }
 
-        private sealed class BridgeClient : IDisposable
+        private sealed class BridgeClient : IDisposable, IStageBClient
         {
             private readonly TcpClient _client;
             private readonly NetworkStream _stream;
@@ -338,11 +535,23 @@ namespace TerrariaAgent.Controller
                 Exchange(new AgentRequest { Type = "arm", SessionId = _sessionId, WorldId = observation.WorldId,
                     Sequence = ++_sequence, ObservationSequence = observation.Sequence });
             }
+            public void OperatorArm(OwnObservation observation)
+            {
+                Exchange(new AgentRequest { Type = "operator_arm", SessionId = _sessionId, WorldId = observation.WorldId,
+                    Sequence = ++_sequence, ObservationSequence = observation.Sequence });
+            }
             public OwnObservation Action(OwnObservation observation, bool left, bool right, bool jump)
+            {
+                return Act(observation, new InputState { Left = left, Right = right, Jump = jump });
+            }
+            public OwnObservation Act(OwnObservation observation, InputState input)
             {
                 ++_actionCount;
                 return Exchange(new AgentRequest { Type = "action", SessionId = _sessionId, WorldId = observation.WorldId,
-                    Sequence = ++_sequence, ObservationSequence = observation.Sequence, TtlMs = 200, Left = left, Right = right, Jump = jump }).Observation;
+                    Sequence = ++_sequence, ObservationSequence = observation.Sequence, TtlMs = 200,
+                    Left = input.Left, Right = input.Right, Jump = input.Jump, UseItem = input.UseItem,
+                    SelectedSlot = input.SelectedSlot, AimTileX = input.AimTileX, AimTileY = input.AimTileY,
+                    CraftWorkBench = input.CraftWorkBench }).Observation;
             }
             public void Stop()
             {

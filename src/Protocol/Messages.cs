@@ -7,13 +7,13 @@ namespace TerrariaAgent.Protocol
 {
     public static class ProtocolLimits
     {
-        public const int Version = 1;
+        public const int Version = 2;
         public const int MaxFrameBytes = 4096;
         public const int MaxActionTtlMs = 250;
         public const int MaxObservationAgeMs = 1000;
     }
 
-    // Shared source: C# 7.3, net48 bridge and net8 controller, no third-party packages.
+    // Shared source: C# 7.3, net48 bridge and modern .NET controller.
     [DataContract]
     public sealed class AgentRequest
     {
@@ -27,6 +27,17 @@ namespace TerrariaAgent.Protocol
         [DataMember(Name = "right", Order = 7)] public bool Right { get; set; }
         [DataMember(Name = "jump", Order = 8)] public bool Jump { get; set; }
         [DataMember(Name = "token", Order = 9, EmitDefaultValue = false)] public string Token { get; set; }
+        [DataMember(Name = "useItem", Order = 10)] public bool UseItem { get; set; }
+        [DataMember(Name = "selectedSlot", Order = 11)] public int SelectedSlot { get; set; } = -1;
+        [DataMember(Name = "aimTileX", Order = 12)] public int AimTileX { get; set; } = -1;
+        [DataMember(Name = "aimTileY", Order = 13)] public int AimTileY { get; set; } = -1;
+        [DataMember(Name = "craftWorkBench", Order = 14)] public bool CraftWorkBench { get; set; }
+
+        // DataContract deserialization skips field initializers. Missing optional
+        // fields must remain neutral, rather than selecting inventory slot zero.
+        [OnDeserializing]
+        private void NeutralDefaults(StreamingContext context)
+        { SelectedSlot = -1; AimTileX = -1; AimTileY = -1; }
     }
 
     [DataContract]
@@ -35,10 +46,21 @@ namespace TerrariaAgent.Protocol
         [DataMember(Name = "left", Order = 0)] public bool Left { get; set; }
         [DataMember(Name = "right", Order = 1)] public bool Right { get; set; }
         [DataMember(Name = "jump", Order = 2)] public bool Jump { get; set; }
+        [DataMember(Name = "useItem", Order = 3)] public bool UseItem { get; set; }
+        [DataMember(Name = "selectedSlot", Order = 4)] public int SelectedSlot { get; set; } = -1;
+        [DataMember(Name = "aimTileX", Order = 5)] public int AimTileX { get; set; } = -1;
+        [DataMember(Name = "aimTileY", Order = 6)] public int AimTileY { get; set; } = -1;
+        [DataMember(Name = "craftWorkBench", Order = 7)] public bool CraftWorkBench { get; set; }
+
+        [OnDeserializing]
+        private void NeutralDefaults(StreamingContext context)
+        { SelectedSlot = -1; AimTileX = -1; AimTileY = -1; }
 
         public InputState Copy()
         {
-            return new InputState { Left = Left, Right = Right, Jump = Jump };
+            return new InputState { Left = Left, Right = Right, Jump = Jump,
+                UseItem = UseItem, SelectedSlot = SelectedSlot, AimTileX = AimTileX, AimTileY = AimTileY,
+                CraftWorkBench = CraftWorkBench };
         }
     }
 
@@ -65,6 +87,10 @@ namespace TerrariaAgent.Protocol
         // Inputs above are sampled actual game control fields. LeaseInputs are
         // merely desired validated inputs and cannot prove game execution.
         [DataMember(Name = "leaseInputs", Order = 17)] public InputState LeaseInputs { get; set; }
+        [DataMember(Name = "canOperatorArm", Order = 18)] public bool CanOperatorArm { get; set; }
+        [DataMember(Name = "gameplay", Order = 19, EmitDefaultValue = false)] public GameplayObservation Gameplay { get; set; }
+        [DataMember(Name = "gamePaused", Order = 20)] public bool GamePaused { get; set; }
+        [DataMember(Name = "optionsOpen", Order = 21)] public bool OptionsOpen { get; set; }
     }
 
     [DataContract]

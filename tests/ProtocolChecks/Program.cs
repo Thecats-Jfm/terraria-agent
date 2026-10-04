@@ -39,11 +39,32 @@ internal static class Program
             { "safe updates and action renewals do not churn control epoch", StableEpoch },
             { "concurrent stop cannot be undone by an older gesture", ConcurrentGestureStop },
             { "stop coordination lock preserves a later writer", StopFileLockSerialization },
+            { "operator start defaults off and survives bootstrap or temporary pause", OperatorBootstrap },
+            { "operator start requires valid fresh own observation and spends failures", OperatorValidation },
+            { "operator first start cannot survive safety revocation", OperatorRevocations },
+            { "normal human consent permanently consumes first operator opportunity", OperatorHumanConsent },
+            { "operator start is once only and preserves the ordinary input lease", OperatorOnceAndExpiry },
+            { "concurrent safety stop wins over first operator start", OperatorConcurrentStop },
             { "bounded network-order frames and truncated streams", TransportChecks.Frames },
             { "loopback authentication and single owner", TransportChecks.AuthenticationAndOwner },
             { "real socket disconnect and rearm boundary", TransportChecks.DisconnectAndRearm },
             { "malformed frame closes owner and releases inputs", TransportChecks.MalformedOwnerFrame },
-            { "server disposal releases active owner", TransportChecks.ServerDispose }
+            { "server disposal releases active owner", TransportChecks.ServerDispose },
+            { "real socket operator opt-in one-shot and reconnect boundary", TransportChecks.OperatorInitialStart },
+            { "real socket failed operator attempt cannot retry but human consent works", TransportChecks.OperatorFailedAttempt },
+            { "real socket delegates guarded operator authorization and fails closed", TransportChecks.OperatorHandlerBoundary },
+            { "A mode rejects every gameplay field unless explicitly enabled", GameplayProtocolChecks.Disabled },
+            { "malformed tool aim slot and craft combinations release active tools", GameplayProtocolChecks.InvalidCombinations },
+            { "legal gameplay endpoints and lease snapshot copies preserve command identity", GameplayProtocolChecks.BoundariesAndCopy },
+            { "all safety boundaries clear pending tools and crafts", GameplayProtocolChecks.RevocationsClear },
+            { "tool and craft lifetime includes time queued at ingress", GameplayProtocolChecks.QueuedExpiry },
+            { "concurrent stop or manual takeover cannot revive tools and crafts", GameplayProtocolChecks.ConcurrentStop },
+            { "bounded B observation fits frame and has no mutable aliases", GameplayProtocolChecks.ObservationBounds },
+            { "real socket tool expiry and disconnect release all B inputs", TransportChecks.GameplayRelease },
+            { "real socket gameplay observation copy bounds preserve actual flags", TransportChecks.GameplayCopyBounds },
+            { "revoked stale or replaced gameplay transaction never executes callback", GameplayProtocolChecks.TransactionRevocation },
+            { "gameplay commit and concurrent stop have a defined lock ordering", GameplayProtocolChecks.TransactionStopOrdering },
+            { "legal gameplay transaction never extends its input lease", GameplayProtocolChecks.TransactionLifetime }
         };
         foreach (var check in checks)
         {
@@ -67,9 +88,9 @@ internal static class Program
     {
         public long Now = 10000;
         public LeaseGate Gate;
-        public Fixture(bool arm = true)
+        public Fixture(bool arm = true, bool allowInitialOperatorArm = false)
         {
-            Gate = new LeaseGate(() => Now);
+            Gate = new LeaseGate(() => Now, allowInitialOperatorArm);
             string reason;
             Require(Gate.OpenSession("session-a", out reason), "open session");
             Gate.UpdateContext("world-a", false, false, false);
@@ -299,6 +320,146 @@ internal static class Program
         }
     }
 
+    private static void OperatorBootstrap()
+    {
+        var disabled = new Fixture(false);
+        string reason;
+        Require(!disabled.Gate.Snapshot().CanOperatorArm, "initial operator mode is disabled by default");
+        Require(!disabled.Gate.ExplicitOperatorArm(disabled.Request(1, "operator_arm"), out reason) &&
+            reason == "initial_operator_arm_unavailable", "network request cannot opt itself in");
+        Neutral(disabled.Gate);
+
+        long now = 10000;
+        var enabled = new LeaseGate(() => now, true);
+        enabled.UpdateContext(null, false, true, true);
+        enabled.ManualTakeover("menu_user_key");
+        Require(!enabled.Snapshot().CanOperatorArm, "bootstrap menu without owner is not armable");
+        Require(enabled.OpenSession("session-a", out reason), "initial authenticated owner");
+        Require(!enabled.Snapshot().CanOperatorArm, "authenticated menu is still not armable");
+        enabled.UpdateContext("world-a", false, false, false);
+        enabled.RecordObservation(1, now);
+        Require(enabled.Snapshot().CanOperatorArm, "first normal world entry keeps explicitly enabled opportunity");
+        enabled.UpdateContext("world-a", false, false, true);
+        Require(!enabled.Snapshot().CanOperatorArm, "temporary unarmed pause or loss of focus prevents immediate arm");
+        enabled.UpdateContext("world-a", false, false, false);
+        Require(enabled.Snapshot().CanOperatorArm, "unarmed readiness recovery does not consume first start");
+        Require(enabled.ExplicitOperatorArm(disabled.Request(1, "operator_arm"), out reason), "fresh first operator request accepted");
+        Require(!enabled.Snapshot().CanOperatorArm && enabled.Snapshot().State == ControlState.Agent,
+            "successful first start consumes the opportunity");
+        Neutral(enabled); // Arming grants ownership; it does not inject any action yet.
+    }
+
+    private static void OperatorValidation()
+    {
+        var ownerBoundary = new Fixture(false, true);
+        var otherOwner = ownerBoundary.Request(1, "operator_arm");
+        otherOwner.SessionId = "old-session";
+        string reason;
+        Require(!ownerBoundary.Gate.ExplicitOperatorArm(otherOwner, out reason) && reason == "wrong_session",
+            "old owner cannot use first operator entry");
+        Require(ownerBoundary.Gate.Snapshot().CanOperatorArm, "old packet cannot consume current owner's opportunity");
+        foreach (string invalid in new[] { "unknown_observation", "old_observation", "wrong_world", "sequence", "unsafe", "type" })
+        {
+            var f = new Fixture(false, true);
+            var request = f.Request(1, "operator_arm");
+            if (invalid == "unknown_observation") request.ObservationSequence = 999;
+            if (invalid == "old_observation") f.Now += 1001;
+            if (invalid == "wrong_world") request.WorldId = "world-b";
+            if (invalid == "sequence") request.Sequence = 0;
+            if (invalid == "unsafe") f.Gate.UpdateContext("world-a", false, false, true);
+            if (invalid == "type") request.Type = "arm";
+            Require(!f.Gate.ExplicitOperatorArm(request, out reason), "invalid first owner attempt rejected: " + invalid);
+            f.Gate.UpdateContext("world-a", false, false, false);
+            f.Gate.RecordObservation(2, f.Now);
+            var retry = f.Request(2, "operator_arm"); retry.ObservationSequence = 2;
+            Require(!f.Gate.ExplicitOperatorArm(retry, out reason) && !f.Gate.Snapshot().CanOperatorArm,
+                "failed owner attempt cannot refresh and retry: " + invalid);
+            Neutral(f.Gate);
+        }
+    }
+
+    private static void OperatorRevocations()
+    {
+        foreach (string revoke in new[] { "stop", "stop_file", "exception", "disconnect", "manual", "death", "world", "menu" })
+        {
+            var f = new Fixture(false, true);
+            string reason;
+            if (revoke == "stop") f.Gate.Stop("session-a");
+            if (revoke == "stop_file") f.Gate.EmergencyStop("stop_file");
+            if (revoke == "exception") f.Gate.EmergencyStop("bridge_exception");
+            if (revoke == "manual") f.Gate.ManualTakeover("physical_movement_or_jump");
+            if (revoke == "death") f.Gate.UpdateContext("world-a", true, false, false);
+            if (revoke == "world") f.Gate.UpdateContext("world-b", false, false, false);
+            if (revoke == "menu") f.Gate.UpdateContext(null, false, true, false);
+            if (revoke == "disconnect")
+            {
+                f.Gate.Disconnect("session-a");
+                Require(f.Gate.OpenSession("session-b", out reason), "new authenticated observer after disconnect");
+            }
+            f.Gate.UpdateContext("world-a", false, false, false);
+            f.Gate.RecordObservation(2, f.Now);
+            var request = f.Request(1, "operator_arm");
+            request.SessionId = f.Gate.Snapshot().SessionId;
+            request.ObservationSequence = 2;
+            Require(!f.Gate.Snapshot().CanOperatorArm && !f.Gate.ExplicitOperatorArm(request, out reason),
+                "initial opportunity permanently consumed by " + revoke);
+            Neutral(f.Gate);
+        }
+        long now = 10000;
+        var connectedMenu = new LeaseGate(() => now, true);
+        string connectedReason;
+        Require(connectedMenu.OpenSession("session-a", out connectedReason), "connected menu owner");
+        connectedMenu.ManualTakeover("physical_window_key");
+        connectedMenu.UpdateContext("world-a", false, false, false);
+        Require(!connectedMenu.Snapshot().CanOperatorArm, "manual takeover while connected consumes opportunity even before world entry");
+    }
+
+    private static void OperatorHumanConsent()
+    {
+        var f = new Fixture(false, true);
+        Require(f.Permit(), "normal human permission can still be granted");
+        Require(!f.Gate.Snapshot().CanOperatorArm, "successful physical permission consumes initial operator opportunity");
+        string reason;
+        Require(!f.Gate.ExplicitOperatorArm(f.Request(1, "operator_arm"), out reason), "operator entry cannot substitute for pending human consent");
+        Require(f.Gate.ExplicitArm(f.Request(1, "arm"), out reason), "normal explicit arm still consumes human consent");
+        f.Gate.ManualTakeover();
+        Require(!f.Gate.ExplicitOperatorArm(f.Request(2, "operator_arm"), out reason), "operator entry cannot recover from manual takeover");
+        Neutral(f.Gate);
+    }
+
+    private static void OperatorOnceAndExpiry()
+    {
+        var f = new Fixture(false, true);
+        string reason;
+        Require(f.Gate.ExplicitOperatorArm(f.Request(1, "operator_arm"), out reason) && reason == "explicitly_operator_armed",
+            "explicit first start enters agent ownership");
+        Neutral(f.Gate);
+        Require(f.Gate.Snapshot().ExpiresAtMs == f.Now + 250, "operator start keeps ordinary 250 ms empty lease");
+        Require(!f.Gate.ExplicitOperatorArm(f.Request(2, "operator_arm"), out reason), "second operator arm rejected without lease renewal");
+        f.Move(2, 100);
+        f.Now += 100;
+        Latched(f.Gate);
+        Require(f.Gate.Snapshot().Reason == "lease_expired" && !f.Gate.Snapshot().CanOperatorArm, "ordinary TTL expiry permanently closes first entry");
+        Require(!f.Gate.ExplicitOperatorArm(f.Request(3, "operator_arm"), out reason), "no operator recovery after expiry");
+        f.Arm(3); // Synthetic new human consent; not an automatic runtime recovery.
+        Require(f.Gate.Snapshot().State == ControlState.Agent, "legacy human rearm remains available after safety stop");
+    }
+
+    private static void OperatorConcurrentStop()
+    {
+        for (int i = 0; i < 100; i++)
+        {
+            var f = new Fixture(false, true);
+            Parallel.Invoke(() => f.Gate.EmergencyStop("stop_file"), () =>
+            {
+                string reason;
+                f.Gate.ExplicitOperatorArm(f.Request(1, "operator_arm"), out reason);
+            });
+            Latched(f.Gate);
+            Require(!f.Gate.Snapshot().CanOperatorArm, "concurrent stop wins regardless of first-arm ordering");
+        }
+    }
+
     private static void Expiry()
     {
         var f = new Fixture(); f.Move();
@@ -479,10 +640,18 @@ internal static class Program
         var reply = new AgentReply
         {
             Type = "observation", Status = "ok", SessionId = "session-a", WorldId = "world-a", Sequence = 1,
-            Observation = new OwnObservation { Sequence = 1, WorldId = "world-a", X = 123.5f, Health = 100, MaxHealth = 100, Inputs = new InputState() }
+            Observation = new OwnObservation { Sequence = 1, WorldId = "world-a", X = 123.5f, Health = 100, MaxHealth = 100, Inputs = new InputState(), CanOperatorArm = true, GamePaused = true, OptionsOpen = true }
         };
         var replyRoundtrip = JsonCodec.Deserialize<AgentReply>(JsonCodec.Serialize(reply));
-        Require(replyRoundtrip.Observation.X == 123.5f && replyRoundtrip.ProtocolVersion == 1, "observation contract roundtrip");
+        Require(replyRoundtrip.Observation.X == 123.5f && replyRoundtrip.ProtocolVersion == 2, "observation protocol v2 contract roundtrip");
+        Require(replyRoundtrip.Observation.CanOperatorArm, "initial operator readiness survives JSON contract roundtrip");
+        Require(replyRoundtrip.Observation.GamePaused && replyRoundtrip.Observation.OptionsOpen, "pause evidence survives JSON contract roundtrip");
+        var minimal = JsonCodec.Deserialize<AgentRequest>(Encoding.UTF8.GetBytes("{\"type\":\"observe\"}"));
+        Require(!minimal.UseItem && !minimal.CraftWorkBench && minimal.SelectedSlot == -1 &&
+            minimal.AimTileX == -1 && minimal.AimTileY == -1, "omitted optional interaction fields stay neutral");
+        var minimalInputs = JsonCodec.Deserialize<InputState>(Encoding.UTF8.GetBytes("{}"));
+        Require(!minimalInputs.UseItem && !minimalInputs.CraftWorkBench && minimalInputs.SelectedSlot == -1 &&
+            minimalInputs.AimTileX == -1 && minimalInputs.AimTileY == -1, "omitted input-state fields stay neutral");
         Throws<InvalidDataException>(() => JsonCodec.Deserialize<AgentRequest>(new byte[4097]));
         Throws<InvalidDataException>(() => JsonCodec.Deserialize<AgentRequest>(new byte[0]));
         request.Token = new string('a', 4096);

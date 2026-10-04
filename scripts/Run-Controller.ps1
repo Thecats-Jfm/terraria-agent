@@ -1,12 +1,15 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('observe', 'stage-a', 'disconnect-test', 'expiry-test')][string]$Mode = 'observe',
+    [ValidateSet('observe', 'stage-a', 'stage-b', 'disconnect-test', 'expiry-test', 'manual-test', 'emergency-test')][string]$Mode = 'observe',
     [switch]$Arm,
+    [switch]$InitialStart,
     [ValidateRange(1, 900)][int]$Seconds = 20,
     [ValidateRange(1, 60)][int]$PermissionWaitSeconds = 15
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ($InitialStart -and $Mode -eq 'observe') { throw '-InitialStart requires an action mode and -Arm; observe never requests control.' }
+if ($Mode -ne 'observe' -and -not $Arm) { throw 'Action modes require an explicit -Arm.' }
 Import-Module (Join-Path $PSScriptRoot 'Workspace-Safety.psm1') -Force
 $taskLayout = Get-WorkspaceLayout
 $taskMarker = Join-Path $taskLayout.Runtime 'current-run.txt'
@@ -24,5 +27,6 @@ if (-not (Test-Path -LiteralPath $taskDll -PathType Leaf)) { throw 'Controller i
 $taskArguments = @($taskDll, '--connection', $taskConnection, '--mode', $Mode, '--seconds', [string]$Seconds,
     '--permission-wait-ms', [string]($PermissionWaitSeconds * 1000))
 if ($Arm) { $taskArguments += '--arm' }
+if ($InitialStart) { $taskArguments += '--initial-start' }
 & dotnet @taskArguments
 exit $LASTEXITCODE

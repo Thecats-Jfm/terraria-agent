@@ -27,14 +27,22 @@ namespace TerrariaAgent.Host
             string runDirectory = null;
             try
             {
-                if (args.Length != 2 || args[0] != "--runtime-root")
-                    throw new ArgumentException("Usage: TerrariaAgent.Host.exe --runtime-root <workspace runtime>");
+                if (args.Length < 2 || args.Length > 4 || args[0] != "--runtime-root")
+                    throw new ArgumentException("Usage: TerrariaAgent.Host.exe --runtime-root <workspace runtime> [--allow-initial-controller-start] [--enable-stage-b]");
+                var flags = new HashSet<string>(StringComparer.Ordinal);
+                for (int i = 2; i < args.Length; ++i)
+                    if ((args[i] != "--allow-initial-controller-start" && args[i] != "--enable-stage-b") || !flags.Add(args[i]))
+                        throw new ArgumentException("Unknown or repeated Host option.");
+                bool allowInitialControllerStart = flags.Contains("--allow-initial-controller-start");
+                bool enableStageB = flags.Contains("--enable-stage-b");
                 string repository = FindRepository();
                 string expectedRoot = Path.GetFullPath(Path.Combine(repository, "..", "..", "work", "terraria-runtime"));
                 string runtimeRoot = Path.GetFullPath(args[1]).TrimEnd(Path.DirectorySeparatorChar);
                 if (!string.Equals(runtimeRoot, expectedRoot.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("Runtime must be the project's isolated work/terraria-runtime directory.");
                 RejectReparseAncestors(runtimeRoot);
+                if (allowInitialControllerStart && File.Exists(Path.Combine(runtimeRoot, "STOP")))
+                    throw new InvalidOperationException("An existing emergency STOP blocks initial controller start. It is never cleared by operator_arm.");
                 string gameDirectory = Path.Combine(runtimeRoot, "game");
                 string gameFile = Path.Combine(gameDirectory, "Terraria.exe");
                 string saveRoot = Path.Combine(runtimeRoot, "saves", "main");
@@ -63,7 +71,8 @@ namespace TerrariaAgent.Host
                 Directory.CreateDirectory(saveRoot);
                 File.WriteAllText(Path.Combine(runDirectory, "host-info.txt"),
                     "runId=" + runId + "\r\nmode=rules\r\ngameVersion=1.4.5.8\r\ngameSHA256=" + GameSha256 +
-                    "\r\ngameDirectory=" + gameDirectory + "\r\nsaveRoot=" + saveRoot + "\r\nloader=own-fixed-purpose-host\r\n");
+                    "\r\ngameDirectory=" + gameDirectory + "\r\nsaveRoot=" + saveRoot + "\r\nloader=own-fixed-purpose-host\r\n" +
+                    "initialControllerStartAllowed=" + allowInitialControllerStart + "\r\nstageBEnabled=" + enableStageB + "\r\n");
                 Directory.SetCurrentDirectory(gameDirectory);
                 // Steam's documented development launch path prevents
                 // RestartAppIfNecessary from opening the original Steam installation.
@@ -105,10 +114,12 @@ namespace TerrariaAgent.Host
                 var bridge = Assembly.LoadFrom(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "TerrariaAgent.Bridge.dll"));
                 var startup = bridge.GetType("TerrariaAgent.Bridge.Startup", true);
                 startup.GetMethod("Initialize", BindingFlags.Public | BindingFlags.Static).Invoke(null,
-                    new object[] { runtimeRoot, saveRoot, runDirectory, runId, token });
+                    new object[] { runtimeRoot, saveRoot, runDirectory, runId, token, allowInitialControllerStart, enableStageB });
                 File.WriteAllText(Path.Combine(runtimeRoot, "current-run.txt"), runDirectory);
                 Console.WriteLine("Isolated Terraria startup. Controls default to manual. Runtime planner: rules.");
                 Console.WriteLine("Arm: Ctrl+Shift+Insert. Stop: Ctrl+Shift+Backspace. Physical movement/jump takes over.");
+                if (allowInitialControllerStart) Console.WriteLine("Initial explicit controller start is enabled once for this run. Reconnect and safety stops cannot renew it.");
+                if (enableStageB) Console.WriteLine("Stage B code preview enabled. Gameplay integration remains unverified until tested in the game.");
                 // This is the first game entry invocation. All launch arguments are
                 // chosen here; external world/cloudworld/savepath arguments are refused.
                 try
