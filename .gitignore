@@ -1,0 +1,41 @@
+# Generated build output
+**/bin/
+**/obj/
+.vs/
+.idea/
+*.user
+*.suo
+
+# Credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.ps1
+
+# Game installations, saves, backups, recordings and runtime logs stay local
+work/
+runtime/
+data/
+backups/
+recordings/
+logs/
+artifacts/
+*.plr
+*.tplr
+*.wld
+*.twld
+*.bak
+*.bak2
+*.tmod
+*.dll
+*.exe
+*.mp4
+*.mkv
+*.webm
+*.jsonl
+*.log
+
+# OS metadata
+Thumbs.db
+.DS_Store
