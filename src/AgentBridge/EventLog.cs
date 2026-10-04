@@ -13,13 +13,16 @@ namespace TerrariaAgent.Bridge
         private readonly BlockingCollection<string> _lines = new BlockingCollection<string>(2048);
         private readonly string _directory;
         private readonly string _runId;
+        private readonly string _challenge;
         private readonly Thread _writer;
         private volatile bool _failed;
 
-        public EventLog(string directory, string runId)
+        public EventLog(string directory, string runId, string challenge = "main")
         {
             _directory = directory;
             _runId = runId;
+            if (challenge != "main" && challenge != "combat_test") throw new ArgumentException("Unknown challenge.");
+            _challenge = challenge;
             _writer = new Thread(WriteLoop) { IsBackground = true, Name = "TerrariaAgent.Log" };
             _writer.Start();
         }
@@ -28,7 +31,7 @@ namespace TerrariaAgent.Bridge
         {
             if (_failed || _lines.IsAddingCompleted) return false;
             var record = new LogRecord { Utc = DateTime.UtcNow.ToString("o"), MonotonicMs = MonotonicClock.NowMs,
-                RunId = _runId, Event = eventName, Detail = detail, Observation = observation };
+                RunId = _runId, Challenge = _challenge, Event = eventName, Detail = detail, Observation = observation };
             string line = Encoding.UTF8.GetString(JsonCodec.Serialize(record));
             try { return _lines.TryAdd(line); }
             catch (InvalidOperationException) { return false; }
@@ -78,6 +81,7 @@ namespace TerrariaAgent.Bridge
             [DataMember(Name = "monotonicMs", Order = 1)] public long MonotonicMs { get; set; }
             [DataMember(Name = "runId", Order = 2)] public string RunId { get; set; }
             [DataMember(Name = "decisionMode", Order = 3)] public string DecisionMode = "rules";
+            [DataMember(Name = "challenge", Order = 7)] public string Challenge { get; set; }
             [DataMember(Name = "event", Order = 4)] public string Event { get; set; }
             [DataMember(Name = "detail", Order = 5)] public string Detail { get; set; }
             [DataMember(Name = "observation", Order = 6, EmitDefaultValue = false)] public OwnObservation Observation { get; set; }

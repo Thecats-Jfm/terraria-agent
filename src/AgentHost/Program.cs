@@ -27,14 +27,15 @@ namespace TerrariaAgent.Host
             string runDirectory = null;
             try
             {
-                if (args.Length < 2 || args.Length > 4 || args[0] != "--runtime-root")
-                    throw new ArgumentException("Usage: TerrariaAgent.Host.exe --runtime-root <workspace runtime> [--allow-initial-controller-start] [--enable-stage-b]");
+                if (args.Length < 2 || args.Length > 5 || args[0] != "--runtime-root")
+                    throw new ArgumentException("Usage: TerrariaAgent.Host.exe --runtime-root <workspace runtime> [--allow-initial-controller-start] [--enable-stage-b] [--combat-test]");
                 var flags = new HashSet<string>(StringComparer.Ordinal);
                 for (int i = 2; i < args.Length; ++i)
-                    if ((args[i] != "--allow-initial-controller-start" && args[i] != "--enable-stage-b") || !flags.Add(args[i]))
+                    if ((args[i] != "--allow-initial-controller-start" && args[i] != "--enable-stage-b" && args[i] != "--combat-test") || !flags.Add(args[i]))
                         throw new ArgumentException("Unknown or repeated Host option.");
                 bool allowInitialControllerStart = flags.Contains("--allow-initial-controller-start");
                 bool enableStageB = flags.Contains("--enable-stage-b");
+                string challenge = flags.Contains("--combat-test") ? "combat_test" : "main";
                 string repository = FindRepository();
                 string expectedRoot = Path.GetFullPath(Path.Combine(repository, "..", "..", "work", "terraria-runtime"));
                 string runtimeRoot = Path.GetFullPath(args[1]).TrimEnd(Path.DirectorySeparatorChar);
@@ -45,7 +46,7 @@ namespace TerrariaAgent.Host
                     throw new InvalidOperationException("An existing emergency STOP blocks initial controller start. It is never cleared by operator_arm.");
                 string gameDirectory = Path.Combine(runtimeRoot, "game");
                 string gameFile = Path.Combine(gameDirectory, "Terraria.exe");
-                string saveRoot = Path.Combine(runtimeRoot, "saves", "main");
+                string saveRoot = Path.Combine(runtimeRoot, "saves", challenge);
                 RejectReparseAncestors(gameFile);
                 RejectReparseAncestors(saveRoot);
                 if (!string.Equals(AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar),
@@ -71,7 +72,7 @@ namespace TerrariaAgent.Host
                 Directory.CreateDirectory(saveRoot);
                 File.WriteAllText(Path.Combine(runDirectory, "host-info.txt"),
                     "runId=" + runId + "\r\nmode=rules\r\ngameVersion=1.4.5.8\r\ngameSHA256=" + GameSha256 +
-                    "\r\ngameDirectory=" + gameDirectory + "\r\nsaveRoot=" + saveRoot + "\r\nloader=own-fixed-purpose-host\r\n" +
+                    "\r\ngameDirectory=" + gameDirectory + "\r\nsaveRoot=" + saveRoot + "\r\nchallenge=" + challenge + "\r\nloader=own-fixed-purpose-host\r\n" +
                     "initialControllerStartAllowed=" + allowInitialControllerStart + "\r\nstageBEnabled=" + enableStageB + "\r\n");
                 Directory.SetCurrentDirectory(gameDirectory);
                 // Steam's documented development launch path prevents

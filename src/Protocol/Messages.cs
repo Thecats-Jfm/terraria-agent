@@ -32,6 +32,8 @@ namespace TerrariaAgent.Protocol
         [DataMember(Name = "aimTileX", Order = 12)] public int AimTileX { get; set; } = -1;
         [DataMember(Name = "aimTileY", Order = 13)] public int AimTileY { get; set; } = -1;
         [DataMember(Name = "craftWorkBench", Order = 14)] public bool CraftWorkBench { get; set; }
+        [DataMember(Name = "craftRecipe", Order = 15, EmitDefaultValue = false)] public string CraftRecipe { get; set; }
+        [DataMember(Name = "up", Order = 16)] public bool Up { get; set; }
 
         // DataContract deserialization skips field initializers. Missing optional
         // fields must remain neutral, rather than selecting inventory slot zero.
@@ -51,6 +53,8 @@ namespace TerrariaAgent.Protocol
         [DataMember(Name = "aimTileX", Order = 5)] public int AimTileX { get; set; } = -1;
         [DataMember(Name = "aimTileY", Order = 6)] public int AimTileY { get; set; } = -1;
         [DataMember(Name = "craftWorkBench", Order = 7)] public bool CraftWorkBench { get; set; }
+        [DataMember(Name = "craftRecipe", Order = 8, EmitDefaultValue = false)] public string CraftRecipe { get; set; }
+        [DataMember(Name = "up", Order = 9)] public bool Up { get; set; }
 
         [OnDeserializing]
         private void NeutralDefaults(StreamingContext context)
@@ -58,9 +62,9 @@ namespace TerrariaAgent.Protocol
 
         public InputState Copy()
         {
-            return new InputState { Left = Left, Right = Right, Jump = Jump,
+            return new InputState { Left = Left, Right = Right, Jump = Jump, Up = Up,
                 UseItem = UseItem, SelectedSlot = SelectedSlot, AimTileX = AimTileX, AimTileY = AimTileY,
-                CraftWorkBench = CraftWorkBench };
+                CraftWorkBench = CraftWorkBench, CraftRecipe = CraftRecipe };
         }
     }
 
@@ -91,6 +95,8 @@ namespace TerrariaAgent.Protocol
         [DataMember(Name = "gameplay", Order = 19, EmitDefaultValue = false)] public GameplayObservation Gameplay { get; set; }
         [DataMember(Name = "gamePaused", Order = 20)] public bool GamePaused { get; set; }
         [DataMember(Name = "optionsOpen", Order = 21)] public bool OptionsOpen { get; set; }
+        [DataMember(Name = "facing", Order = 22)] public int Facing { get; set; }
+        [DataMember(Name = "itemAnimation", Order = 23)] public int ItemAnimation { get; set; }
     }
 
     [DataContract]

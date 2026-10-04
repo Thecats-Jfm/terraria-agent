@@ -16,6 +16,7 @@ namespace TerrariaAgent.Controller
         private static StreamWriter _log;
         private static long _actionCount;
         private static string _mode;
+        private static string _challenge = "main";
 
         private static int Main(string[] args)
         {
@@ -32,9 +33,9 @@ namespace TerrariaAgent.Controller
             {
                 var options = Parse(args);
                 _mode = options.ContainsKey("mode") ? options["mode"] : "observe";
-                if (_mode != "observe" && _mode != "stage-a" && _mode != "stage-b" && _mode != "disconnect-test" && _mode != "expiry-test" &&
+                if (_mode != "observe" && _mode != "stage-a" && _mode != "stage-b" && _mode != "harvest-wood" && !IsStageC(_mode) && _mode != "disconnect-test" && _mode != "expiry-test" &&
                     _mode != "manual-test" && _mode != "emergency-test")
-                    throw new ArgumentException("Mode must be observe, stage-a, stage-b, disconnect-test, expiry-test, manual-test or emergency-test.");
+                    throw new ArgumentException("Unknown mode; use observe, stage-a, stage-b, stone-test, craft-test, platform-test, combat-trial, prepare or a named safety test.");
                 bool initialStart = options.ContainsKey("initial-start");
                 if (initialStart && _mode == "observe")
                     throw new ArgumentException("--initial-start requires an action mode and explicit --arm; observe cannot request control.");
@@ -44,9 +45,16 @@ namespace TerrariaAgent.Controller
                 permissionWaitMs = options.ContainsKey("permission-wait-ms") ? int.Parse(options["permission-wait-ms"]) : 15000;
                 if (permissionWaitMs < 1000 || permissionWaitMs > 60000)
                     throw new ArgumentException("Permission wait must be 1000..60000 milliseconds.");
+                // Reject recovery options before connecting or issuing any arm.
+                if (options.ContainsKey("health-target") && _mode != "recover-health")
+                    throw new ArgumentException("--health-target is only supported by recover-health.");
+                int healthTarget = options.ContainsKey("health-target") ? int.Parse(options["health-target"]) : 60;
+                StageC.ValidateHealthTarget(_mode, healthTarget);
                 string path;
                 if (!options.TryGetValue("connection", out path)) throw new ArgumentException("--connection <connection.local.json> is required.");
                 var info = JsonCodec.Deserialize<ConnectionInfo>(File.ReadAllBytes(Path.GetFullPath(path)));
+                _challenge = info.Challenge ?? "main"; // Legacy local metadata predates profiles.
+                if (_challenge != "main" && _challenge != "combat_test") throw new InvalidDataException("Unknown challenge profile.");
                 logDirectory = Path.GetFullPath(info.LogDirectory);
                 _log = new StreamWriter(Path.Combine(logDirectory, "controller-" + DateTime.UtcNow.ToString("HHmmss") + "-" + Guid.NewGuid().ToString("N").Substring(0, 6) + ".jsonl"), false, new UTF8Encoding(false)) { AutoFlush = true };
                 Console.CancelKeyPress += (sender, eventArgs) => { eventArgs.Cancel = true; _cancelled = true; };
@@ -123,11 +131,16 @@ namespace TerrariaAgent.Controller
                         success = true;
                         reason = "basic_actions_complete_safety_matrix_still_separate";
                     }
-                    else if (_mode == "stage-b")
+                    else if (_mode == "stage-b" || _mode == "harvest-wood")
                     {
+                        bool newCraftObserved = false;
                         try
                         {
-                            foreach (StageBTaskResult task in StageB.Run(client, () => _cancelled, Record)) tasks.Add(task);
+                            foreach (StageBTaskResult task in StageB.Run(client, () => _cancelled, Record, _mode == "harvest-wood"))
+                            {
+                                tasks.Add(task);
+                                if (task.Skill == "craft_workbench" && task.Status == "success") newCraftObserved = true;
+                            }
                         }
                         catch (StageBFailure error)
                         {
@@ -135,7 +148,25 @@ namespace TerrariaAgent.Controller
                             throw;
                         }
                         success = true;
-                        reason = "tree_pickup_normal_craft_and_placement_observed";
+                        reason = _mode == "harvest-wood" ? "tree_chop_and_wood_pickup_observed;no_new_craft_claimed" : newCraftObserved ? "tree_pickup_normal_craft_and_placement_observed" :
+                            "existing_workbench_reused_or_placed;no_new_tree_or_craft_claimed";
+                    }
+                    else if (IsStageC(_mode))
+                    {
+                        int trialSeconds = options.ContainsKey("seconds") ? int.Parse(options["seconds"]) : 30;
+                        if (trialSeconds < 1 || trialSeconds > 120) throw new ArgumentException("Stage C duration must be 1..120 seconds.");
+                        try
+                        {
+                            string recipe = options.ContainsKey("recipe") ? options["recipe"] : GameplayRecipeIds.WoodenBow;
+                            foreach (StageCTaskResult task in StageC.Run(client, () => _cancelled, Record, _mode, trialSeconds, recipe, healthTarget)) tasks.Add(task);
+                        }
+                        catch (StageCFailure error)
+                        {
+                            foreach (StageCTaskResult task in error.Results) tasks.Add(task);
+                            throw;
+                        }
+                        success = true;
+                        reason = "bounded_stage_c_task_completed_see_actual_skill_results";
                     }
                     else if (_mode == "manual-test" || _mode == "emergency-test")
                     {
@@ -189,9 +220,9 @@ namespace TerrariaAgent.Controller
                 if (_log != null) _log.Dispose();
                 if (logDirectory != null)
                 {
-                    string report = JsonSerializer.Serialize(new { mode = _mode, decisionMode = "rules", success,
+                    string report = JsonSerializer.Serialize(new { mode = _mode, challenge = _challenge, decisionMode = "rules", success,
                         controlAuthorization, reason, actions = _actionCount, elapsedMs = timer.ElapsedMilliseconds, permissionWaitMs, advancingObservations, tasks,
-                        scope = _mode == "stage-b" ?
+                        scope = IsStageC(_mode) ? "This report covers the bounded resource/craft/place or encounter trial only. Enemy disappearance is not a verified kill; this is not Boss completion." : _mode == "stage-b" ?
                             "This report covers only the observed tree/resource/workbench task in this game connection; it does not establish later progression or Boss success." :
                             "This report covers this game connection only; compilation and this subset do not establish all of stage A.",
                         recordingValidated = false }, new JsonSerializerOptions { WriteIndented = true });
@@ -204,11 +235,25 @@ namespace TerrariaAgent.Controller
         private static OwnObservation WaitForPermission(BridgeClient client, int timeoutMs)
         {
             var timer = Stopwatch.StartNew();
+            // A paused connection may legitimately wait for the operator's
+            // resume gesture. After observing an unpaused safe world, a new
+            // revoked context is a failed attempt, not a reason to stand idle
+            // for the remainder of the permission budget.
+            bool safeWorldObserved = false;
             while (timer.ElapsedMilliseconds < timeoutMs)
             {
                 CheckCancellation();
                 var observation = client.Observe();
                 if (Ready(observation) && observation.CanArm) return observation;
+                if (Ready(observation)) safeWorldObserved = true;
+                if (safeWorldObserved && observation != null &&
+                    (observation.Dead || observation.Menu || observation.ControlState == "LatchedStop" &&
+                    (observation.Reason == "text_input" || observation.Reason == "world_changed" ||
+                     observation.Reason == "dead" || observation.Reason == "emergency_window_hotkey" ||
+                     observation.Reason == "stop_file_lock_busy" || observation.Reason == "stop_file" ||
+                     observation.Reason == "window_hotkey_error" ||
+                     observation.Reason == "physical_window_key" || observation.Reason == "physical_window_pointer")))
+                    throw new InvalidOperationException("human_permission_context_revoked:" + observation.Reason);
                 Thread.Sleep(50);
             }
             throw new InvalidOperationException("human_arm_or_ready_world_timeout");
@@ -469,19 +514,25 @@ namespace TerrariaAgent.Controller
             return observation;
         }
 
+        private static bool IsStageC(string mode)
+        {
+            return mode == "stone-test" || mode == "dig-test" || mode == "collect-soil" || mode == "torch-test" || mode == "craft-test" || mode == "platform-test" || mode == "combat-trial" || mode == "recover-health" || mode == "seek-stone" || mode == "forage-stone" || mode == "prepare";
+        }
+
         private static bool Ready(OwnObservation observation)
         {
-            return observation != null && !observation.Menu && !observation.Dead && !observation.TextInput && !string.IsNullOrEmpty(observation.WorldId);
+            return observation != null && !observation.Menu && !observation.Dead && !observation.TextInput &&
+                !observation.GamePaused && !observation.OptionsOpen && !string.IsNullOrEmpty(observation.WorldId);
         }
         private static bool ValidObservation(OwnObservation observation)
         {
             return observation != null && observation.Sequence > 0 && observation.GameTick > 0 && observation.MonotonicMs >= 0;
         }
-        private static bool Any(InputState input) { return input != null && (input.Left || input.Right || input.Jump || input.UseItem); }
+        private static bool Any(InputState input) { return input != null && (input.Left || input.Right || input.Up || input.Jump || input.UseItem); }
         private static void CheckCancellation() { if (_cancelled) throw new OperationCanceledException("cancelled"); }
         private static void Record(string name, string detail, OwnObservation observation)
         {
-            if (_log != null) _log.WriteLine(JsonSerializer.Serialize(new { utc = DateTime.UtcNow.ToString("o"), decisionMode = "rules", task = _mode, @event = name, detail, observation }));
+            if (_log != null) _log.WriteLine(JsonSerializer.Serialize(new { utc = DateTime.UtcNow.ToString("o"), challenge = _challenge, decisionMode = "rules", task = _mode, @event = name, detail, observation }));
         }
 
         private static Dictionary<string, string> Parse(string[] arguments)
@@ -549,9 +600,9 @@ namespace TerrariaAgent.Controller
                 ++_actionCount;
                 return Exchange(new AgentRequest { Type = "action", SessionId = _sessionId, WorldId = observation.WorldId,
                     Sequence = ++_sequence, ObservationSequence = observation.Sequence, TtlMs = 200,
-                    Left = input.Left, Right = input.Right, Jump = input.Jump, UseItem = input.UseItem,
+                    Left = input.Left, Right = input.Right, Up = input.Up, Jump = input.Jump, UseItem = input.UseItem,
                     SelectedSlot = input.SelectedSlot, AimTileX = input.AimTileX, AimTileY = input.AimTileY,
-                    CraftWorkBench = input.CraftWorkBench }).Observation;
+                    CraftWorkBench = input.CraftWorkBench, CraftRecipe = input.CraftRecipe }).Observation;
             }
             public void Stop()
             {

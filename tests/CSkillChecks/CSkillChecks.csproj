@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="../../src/Controller/StageB.cs" Link="StageB.cs" />
+    <Compile Include="../../src/Controller/StageC.cs" Link="StageC.cs" />
+    <Compile Include="../../src/Protocol/*.cs" Link="Protocol/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

@@ -313,6 +313,7 @@ namespace TerrariaAgent.Bridge
                 Health = value.Health, MaxHealth = value.MaxHealth, Dead = value.Dead,
                 Menu = value.Menu, TextInput = value.TextInput, ControlState = value.ControlState,
                 GamePaused = value.GamePaused, OptionsOpen = value.OptionsOpen,
+                Facing = value.Facing, ItemAnimation = value.ItemAnimation,
                 Reason = value.Reason, Inputs = value.Inputs == null ? new InputState() : value.Inputs.Copy(),
                 LeaseInputs = value.LeaseInputs == null ? new InputState() : value.LeaseInputs.Copy(),
                 GameTick = value.GameTick, MonotonicMs = value.MonotonicMs, CanArm = value.CanArm,

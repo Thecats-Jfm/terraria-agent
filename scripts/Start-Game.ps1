@@ -1,5 +1,6 @@
 [CmdletBinding()]
-param([switch]$DesktopAvailable, [switch]$AllowInitialControllerStart, [switch]$EnableStageB)
+param([switch]$DesktopAvailable, [switch]$AllowInitialControllerStart, [switch]$EnableStageB,
+    [ValidateSet('main', 'combat_test')][string]$Challenge = 'main')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'Workspace-Safety.psm1') -Force
@@ -30,14 +31,16 @@ if (-not (Test-Path -LiteralPath $taskHost -PathType Leaf)) { throw 'Build the r
 $taskStamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 $taskStdout = Join-Path $taskLayout.Runtime "logs/launch-$taskStamp.stdout.log"
 $taskStderr = Join-Path $taskLayout.Runtime "logs/launch-$taskStamp.stderr.log"
-# The console helper is hidden. The game creates its own interactive window.
+# This process hosts the explicitly requested interactive game. A Hidden
+# startup can also hide XNA's small window after windowed settings are saved.
 # Initial authorization is optional, explicit and consumed once by the bridge;
 # this launcher never synthesizes keyboard/mouse input or arms a controller.
 $taskHostArguments = @('--runtime-root', ('"' + $taskLayout.Runtime + '"'))
 if ($AllowInitialControllerStart) { $taskHostArguments += '--allow-initial-controller-start' }
 if ($EnableStageB) { $taskHostArguments += '--enable-stage-b' }
+if ($Challenge -eq 'combat_test') { $taskHostArguments += '--combat-test' }
 $taskProcess = Start-Process -FilePath $taskHost -ArgumentList $taskHostArguments `
-    -WorkingDirectory $taskLayout.Game -WindowStyle Hidden -PassThru `
+    -WorkingDirectory $taskLayout.Game -WindowStyle Normal -PassThru `
     -RedirectStandardOutput $taskStdout -RedirectStandardError $taskStderr
 Write-Output "Game host PID: $($taskProcess.Id). Controls default to manual; rule controller is separate."
 if ($AllowInitialControllerStart) { Write-Output 'One initial explicit controller start is authorized; stops and reconnections cannot renew it.' }

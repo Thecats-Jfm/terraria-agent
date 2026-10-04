@@ -230,22 +230,28 @@ namespace TerrariaAgent.Protocol
                     return RejectAndLatchLocked("expired_queued_action", out reason);
                 if (request.Left && request.Right)
                     return RejectAndLatchLocked("conflicting_directions", out reason);
-                bool gameplayRequest = request.UseItem || request.CraftWorkBench || request.SelectedSlot != -1 ||
+                bool crafting = request.CraftWorkBench || request.CraftRecipe != null;
+                bool gameplayRequest = request.Up || request.UseItem || crafting || request.SelectedSlot != -1 ||
                     request.AimTileX != -1 || request.AimTileY != -1;
                 if (gameplayRequest && !_allowGameplayActions)
                     return RejectAndLatchLocked("gameplay_actions_disabled", out reason);
+                if (request.Up && (!(request.Left ^ request.Right) || request.Jump || request.UseItem || crafting ||
+                    request.AimTileX != -1 || request.AimTileY != -1))
+                    return RejectAndLatchLocked("invalid_platform_up_action", out reason);
                 if (request.SelectedSlot < -1 || request.SelectedSlot > 49 || request.AimTileX < -1 || request.AimTileY < -1 ||
                     request.AimTileX > 32767 || request.AimTileY > 32767 ||
                     ((request.AimTileX == -1) != (request.AimTileY == -1)) ||
                     (request.UseItem && (request.SelectedSlot < 0 || request.AimTileX < 0)) ||
-                    (request.CraftWorkBench && (request.UseItem || request.Left || request.Right || request.Jump ||
+                    (request.CraftRecipe != null && !GameplayRecipeIds.IsKnown(request.CraftRecipe)) ||
+                    (request.CraftWorkBench && request.CraftRecipe != null) ||
+                    (crafting && (request.UseItem || request.Left || request.Right || request.Jump || request.Up ||
                         request.SelectedSlot != -1 || request.AimTileX != -1)))
                     return RejectAndLatchLocked("invalid_gameplay_action", out reason);
                 _lastSequence = request.Sequence;
                 _expiresAtMs = receivedAtMs + request.TtlMs;
-                _inputs = new InputState { Left = request.Left, Right = request.Right, Jump = request.Jump,
+                _inputs = new InputState { Left = request.Left, Right = request.Right, Jump = request.Jump, Up = request.Up,
                     UseItem = request.UseItem, SelectedSlot = request.SelectedSlot, AimTileX = request.AimTileX,
-                    AimTileY = request.AimTileY, CraftWorkBench = request.CraftWorkBench };
+                    AimTileY = request.AimTileY, CraftWorkBench = request.CraftWorkBench, CraftRecipe = request.CraftRecipe };
                 _reason = "action_active";
                 reason = _reason;
                 return true;

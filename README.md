@@ -1,34 +1,25 @@
 # Terraria Agent
 
-开发一个能在真实 Terraria 游戏中运行、观看、测试和继续改进的 Agent。长期目标是新档推进到月亮领主；第一天先实现观察和动作闭环，再完成砍树、拾取、制作并放置工作台，之后尝试克苏鲁之眼。
+A local, rule-based agent for vanilla Terraria **1.4.5.8** on Windows. A C# bridge filters observations inside the game, a continuous controller executes bounded actions, and state-machine skills decide what to do next. No runtime model API is required.
 
-当前 TA1 / The Annoyed Frontier 保留为 technical_validation 开发验收档：早期 Alt+F4 曾造成角色与世界部分保存不一致。真实技能结果仍有效，后续正式新档 Boss 主挑战另建干净 Classic 人物与世界，不使用本档留下的材料。
+## Current status
 
-当前已用自有 Host/Bridge 实际进入并重进专用新档。第七次基本动作及新版首次直接 A 均通过：65 条动作，右移 100.71094 像素、跳起 78.808105 像素、两次停止实际输入清空且 VX=0。活动断连、TTL、人工接管和紧急停止也均先确认真实右移，再触发停控并核对实际输入释放。**这些 A 项已通过，死亡、文本输入、切世界等完整安全矩阵仍待**。已知累计死亡 6 次，其中 B 后暂停失败死亡 1 次；早期菜单无活动 Agent 的紧停和失败记录保留。
+- **A verified in-game:** observation, movement, stopping and jumping, plus disconnect, lease-expiry, emergency-stop and manual-takeover checks.
+- **B verified in-game:** discover a visible tree, approach, chop with a normal axe, collect wood, craft a workbench with a normal recipe and place it.
+- **C partially verified in-game:** selected normal crafting and placement, soil mining and natural health recovery. Stone acquisition, arrow combat and Boss progression remain unverified.
 
-新版协议 v2 支持显式一次性 operator_arm；停止、断连、死亡或人工接管后不能再次使用，STOP.lock 保护授权与正常制作提交，不删除或绕过现有 STOP。50 项协议/本机回环、16 项几何/DTO、4 项技能边界检查通过，均使用合成环境。代码轮用独立 CodeOnly 输出；重新授权桌面后才有实机成绩。最新普通整体 Build 零警告、零错误，已用于本轮游戏。
+Compilation and synthetic checks are reported separately from game acceptance. The long-term goal is normal progression toward the Moon Lord; it is not a completed capability.
 
-**B 完整任务已两次实机通过，正常暂停/恢复及保存后重进保留工作台也通过**。首次 Wood 0→35→25、工作台物品 0→1→0、世界 tile (2101,281) 完整工作台；第二次同 Host 新人工许可后 Wood49→52→42、工作台0→1→0、世界 tile (2102,281)。正常 Save&Exit 后新 run 重进确认完整工作台仍在。首跑材料不足的失败保留。B 默认关闭，Host 必须显式 --enable-stage-b；C/D 未实现，规则模式、无付费模型 API。公开仓库为 [Thecats-Jfm/terraria-agent](https://github.com/Thecats-Jfm/terraria-agent)，只同步源码、脚本和验收摘要。
+## Boundaries
 
-逐次结果见 [验收记录](docs/VALIDATION.md)。Ctrl+Shift+Home 正常暂停、Ctrl+Shift+End 恢复且保持锁停；同世界新许可后完成第二次 B，随后正常 Save&Exit。最新 run `20261004T161025Z-de709aaf` 完成人工接管与紧急停止，目前游戏仍暂停、HP45，未关闭。manualTakeovers=3 包含一次普通接管及紧急组合键的两次状态转换，不是三个独立测试。断连107ms、TTL198ms、人工接管61ms、紧停1ms均是采样观察上界，不能称精确输入或按键延迟。历史 Alt+F4 不证明完整保存。近期不录屏，证据为本地日志、结果和截图。
+Use a new Classic character and Classic world with isolated local saves. The main challenge permits normal materials, recipes, reach, tools and damage. It does not permit item grants, health or damage edits, teleportation, time skips or hidden terrain access. A separate combat-test profile has separate acceptance.
 
-- [最初第一阶段计划](docs/TONIGHT_PLAN.md)：早期约 3 小时只推进 A 的范围记录。
-- [一天开发计划](docs/PLAN.md)：项目路径、结构、阶段门槛、时间分配、操作规则与验收。
-- [环境和官方 API 核对](docs/ENVIRONMENT.md)：已查明的安装、版本与仍需实机验证的能力。
-- [验收记录](docs/VALIDATION.md)：按阶段区分实机、编译和测试结果。
-- [GitHub 使用说明](docs/GITHUB.md)：仓库、分支、同步和身份设置。
-- [源码安全审查](docs/SECURITY_REVIEW.md)：检查范围、条件风险和最小接入限制。
-- [磁盘预算](docs/DISK_BUDGET.md)：实测空间及关键片段/全天录像估算。
-- [启动与验收](docs/RUNNING.md)：直接启动入口、规则控制、停止和证据边界。
-- [隔离准备与构建](docs/BUILD.md)：已实际运行的备份、隔离复制和离线构建。
-- [本机游戏接口](docs/GAME_API.md)：原版 1.4.5.8 的准确签名、输入时机和存档边界。
-- [动作协议](docs/PROTOCOL.md)：v2 首次授权、租期、工具输入和离线检查。
-- [固定依赖](docs/DEPENDENCIES.md)：游戏、运行框架与官方 Harmony 包的版本和哈希。
+The bridge exposes own state, currently visible filtered targets and limited legally observed history. Communication binds only to **127.0.0.1**, requires authentication and explicit ownership, and uses bounded frames and short action leases. Expiry, disconnect, death, unsafe UI, world changes and takeover release input. Reconnection cannot authorize control.
 
-项目目录为 `<workspace>\outputs\terraria-agent`，启动与备份脚本从自身位置解析实际工作区。游戏存档、备份与运行数据保存在仓库外的独立目录，路径见计划。
+Human authorization and emergency controls remain available. The optional initial controller start requires an explicit launch option and is consumed once. A stop cannot be cleared by automatic rearming.
 
-## 下一步
+## Development
 
-优先补死亡、文本输入、切世界等安全项及更多 B 回归，再扩展必要资源技能，C/D 当前未实现。按用户要求短测后用正常暂停入口并实际确认、复用世界，只有 Bridge/Host 更新需重载。短按 Esc/AltTab 曾暂停失败，不能依赖它保护角色；暂停/恢复不自动 rearm，详见运行说明。
+The fixed-purpose Host loads an isolated verified game copy and our bridge with pinned Harmony **2.3.3**. Game APIs are checked against the installed assembly; the runtime does not depend on tModLoader. Normal crafting uses `CraftingRequests.CraftItem`, and ordinary melee facing uses guarded `Player.ChangeDir`. Item use and movement remain normal game controls. Host and Bridge target .NET Framework **4.8**, while the controller and standalone checks target .NET **8**.
 
-当前无需 tModLoader，也不加载上游 Injector、Core、Vault、DebugTools 或可选游戏模组。基本动作、四类活动停控、B 完整任务及暂停/恢复/保存重进已有实机结果；完整安全矩阵和 C/D 仍待，不能宣称完整通关流程可用。
+See [running instructions](docs/RUNNING.md). Source, launch scripts and offline checks are included. Credentials, saves, recordings and detailed local run evidence are excluded from public publication.

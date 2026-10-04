@@ -12,5 +12,6 @@ namespace TerrariaAgent.Protocol
         [DataMember(Name = "runId", Order = 2)] public string RunId { get; set; }
         [DataMember(Name = "logDirectory", Order = 3)] public string LogDirectory { get; set; }
         [DataMember(Name = "protocolVersion", Order = 4)] public int ProtocolVersion { get; set; } = ProtocolLimits.Version;
+        [DataMember(Name = "challenge", Order = 5)] public string Challenge { get; set; } = "main";
     }
 }

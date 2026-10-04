@@ -45,12 +45,12 @@ namespace TerrariaAgent.Controller
     public static class StageB
     {
         public static List<StageBTaskResult> Run(IStageBClient client, Func<bool> isCancelled,
-            Action<string, string, OwnObservation> record)
+            Action<string, string, OwnObservation> record, bool harvestOnly = false)
         {
             if (client == null) throw new ArgumentNullException("client");
             if (isCancelled == null) throw new ArgumentNullException("isCancelled");
             if (record == null) throw new ArgumentNullException("record");
-            return new Runner(client, isCancelled, record).Run();
+            return new Runner(client, isCancelled, record).Run(harvestOnly);
         }
 
         private sealed class Runner
@@ -68,6 +68,7 @@ namespace TerrariaAgent.Controller
             private OwnObservation _skillStart;
             private string _world;
             private string _skill = "observe";
+            private int _runStartHealth = -1;
             private int _attempts = 1;
             private VisibleTarget _target;
             private long _lastAdvanceMs;
@@ -80,7 +81,7 @@ namespace TerrariaAgent.Controller
                 _client = client; _cancelled = cancelled; _record = record;
             }
 
-            public List<StageBTaskResult> Run()
+            public List<StageBTaskResult> Run(bool harvestOnly)
             {
                 try
                 {
@@ -91,6 +92,20 @@ namespace TerrariaAgent.Controller
                     while (!Newer(_current, initial) && _skillTimer.ElapsedMilliseconds < 1000) Step(new InputState());
                     if (!Newer(_current, initial)) Fail("observation_not_advancing");
                     Succeed("fresh_gameplay_observation");
+
+                    if (!harvestOnly && _current.Gameplay.WorkBenchTargets != null && _current.Gameplay.WorkBenchTargets.Length > 0)
+                    {
+                        Begin("reuse_workbench", "a complete normally observed workbench already exists");
+                        Succeed("existing_visible_workbench;no_new_craft_or_tree_task_claimed");
+                        return _results;
+                    }
+                    if (!harvestOnly && _current.Gameplay.WorkBenches > 0)
+                    {
+                        Begin("reuse_workbench_item", "normally observed own workbench item; do not craft twice");
+                        Succeed("existing_backpack_workbench;resume_placement_only");
+                        Place();
+                        return _results;
+                    }
 
                     Begin("discover_visible_tree", "requires filtered local TreeTargets");
                     _target = Nearest(_current.Gameplay.TreeTargets, null, false);
@@ -105,6 +120,7 @@ namespace TerrariaAgent.Controller
 
                     OwnObservation beforeChop = Chop(tree);
                     Collect(tree, beforeChop);
+                    if (harvestOnly) return _results;
                     Craft();
                     Place();
                     return _results;
@@ -209,6 +225,16 @@ namespace TerrariaAgent.Controller
             {
                 Begin("craft_workbench", "requires 10 Wood and normal recipe availability; one craft request only");
                 _target = null;
+                int stableWood = _current.Gameplay.Wood;
+                var settling = Stopwatch.StartNew();
+                long lastChange = 0;
+                while (settling.ElapsedMilliseconds - lastChange < 500 && settling.ElapsedMilliseconds < 3000)
+                {
+                    Step(new InputState());
+                    if (_current.Gameplay.Wood != stableWood)
+                    { stableWood = _current.Gameplay.Wood; lastChange = settling.ElapsedMilliseconds; }
+                }
+                if (settling.ElapsedMilliseconds - lastChange < 500) Fail("pickup_not_settled_before_craft_3s");
                 if (_current.Gameplay.Wood < 10) Fail("insufficient_materials_wood_10");
                 var ready = Stopwatch.StartNew();
                 while (!_current.Gameplay.CanCraftWorkBench && ready.ElapsedMilliseconds < 3000)
@@ -231,7 +257,9 @@ namespace TerrariaAgent.Controller
                         _current.Gameplay.WorkBenches == benches + 1)
                     {
                         Step(new InputState());
-                        if (_current.Gameplay.Wood != wood - 10 || _current.Gameplay.WorkBenches != benches + 1)
+                        // The previous fresh sample already proved exact normal
+                        // consumption. Later legitimate pickup may add Wood.
+                        if (_current.Gameplay.Wood < wood - 10 || _current.Gameplay.WorkBenches != benches + 1)
                             Fail("craft_material_delta_not_retained");
                         Succeed("actual_wood_minus_10_and_workbench_plus_1", before);
                         return;
@@ -365,8 +393,11 @@ namespace TerrariaAgent.Controller
                 // even when the previous accepted sample still said Agent.
                 _cleanupAllowed = false;
                 if (sample == null) Fail("missing_observation");
-                if (sample.Menu || sample.Dead || sample.TextInput || string.IsNullOrEmpty(sample.WorldId)) Fail("unsafe_world_menu_death_or_text_input");
+                if (sample.Menu || sample.Dead || sample.TextInput || sample.GamePaused || sample.OptionsOpen ||
+                    string.IsNullOrEmpty(sample.WorldId)) Fail("unsafe_world_menu_death_or_text_input");
                 if (sample.Health < 25) Fail("unsafe_low_health");
+                if (_runStartHealth < 0) _runStartHealth = sample.Health;
+                if (_runStartHealth - sample.Health >= 20) Fail("resource_task_stopped_after_health_loss_20");
                 if (sample.ControlState != "Agent") Fail("control_lost_no_automatic_rearm");
                 if (sample.Sequence <= 0 || sample.GameTick <= 0 || sample.MonotonicMs < 0 ||
                     float.IsNaN(sample.X) || float.IsInfinity(sample.X) || float.IsNaN(sample.Y) || float.IsInfinity(sample.Y))

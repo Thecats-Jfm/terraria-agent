@@ -64,7 +64,12 @@ internal static class Program
             { "real socket gameplay observation copy bounds preserve actual flags", TransportChecks.GameplayCopyBounds },
             { "revoked stale or replaced gameplay transaction never executes callback", GameplayProtocolChecks.TransactionRevocation },
             { "gameplay commit and concurrent stop have a defined lock ordering", GameplayProtocolChecks.TransactionStopOrdering },
-            { "legal gameplay transaction never extends its input lease", GameplayProtocolChecks.TransactionLifetime }
+            { "legal gameplay transaction never extends its input lease", GameplayProtocolChecks.TransactionLifetime },
+            { "platform Up requires B and one compatible movement direction", PlatformUpChecks.Admission },
+            { "platform Up copies and current same-direction proof fails closed", PlatformUpChecks.ProofAndCopy },
+            { "all lease and lifecycle stops release platform Up without rearm", PlatformUpChecks.Release },
+            { "platform Up cannot execute a revoked or stale transaction", PlatformUpChecks.Transaction },
+            { "fresh proven flat ground releases only platform Up without renewing the lease", PlatformUpChecks.AscentHandoff }
         };
         foreach (var check in checks)
         {

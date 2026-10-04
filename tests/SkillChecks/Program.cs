@@ -7,7 +7,7 @@ using TerrariaAgent.Protocol;
 
 internal static class Program
 {
-    // Four synthetic, offline boundaries. No game process, save file,
+    // Synthetic offline boundaries. No game process, save file,
     // live world, or gameplay success is exercised by these fixtures.
     private static int Main()
     {
@@ -24,8 +24,39 @@ internal static class Program
                 !failure.Results.Any(task => task.Skill == "chop_tree" && task.Status == "success"),
             client => client.Hidden && client.UseAfterHidden == 0 && client.UseActions >= 2, results);
         CheckPartialPickup(results);
+        CheckLatePickup(results);
+        Check("late_pickup_cannot_replace_first_exact_consumption_proof", new FakeClient("masked_craft"),
+            failure => failure.Message.Contains("craft_timeout") &&
+                !failure.Results.Any(task => task.Skill == "craft_workbench" && task.Status == "success"),
+            client => client.CraftRequests == 1 && client.LateExactSamples == 0 && client.PlacementRequests == 0, results);
+        Check("twenty_health_loss_while_still_healthy_stops_resource_tools", new FakeClient("damage_twenty"),
+            failure => failure.Message.Contains("resource_task_stopped_after_health_loss_20") &&
+                !failure.Results.Any(task => task.Skill == "chop_tree" && task.Status == "success"),
+            client => client.UseActions == 1 && client.DamageSamples == 1 && client.LastHealth == 80 &&
+                client.GameplayAfterUnsafe == 0 && client.CraftRequests == 0 && client.PlacementRequests == 0, results);
+        foreach (string scenario in new[] { "paused", "options_open" })
+            Check("resource_task_rejects_" + scenario + "_before_more_tools", new FakeClient(scenario),
+                failure => failure.Message.Contains("unsafe_world_menu_death_or_text_input"),
+                client => client.UseActions == 1 && client.UnsafeUiSamples == 1 && client.LastHealth == 100 &&
+                    client.GameplayAfterUnsafe == 0 && client.CraftRequests == 0 && client.PlacementRequests == 0, results);
         Console.WriteLine(JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
         return 0;
+    }
+
+    private static void CheckLatePickup(List<object> results)
+    {
+        var client = new FakeClient("late_pickup");
+        List<StageBTaskResult> tasks = StageB.Run(client, () => false, (kind, detail, observation) => { });
+        StageBTaskResult craft = tasks.Single(task => task.Skill == "craft_workbench");
+        if (client.CraftRequests != 1 || client.LateExactSamples != 1 || client.LateGainSamples < 1 ||
+            client.CraftWood != 26 || craft.Status != "success" || craft.WoodBefore != 26 ||
+            craft.WoodAfter <= 16 || craft.WorkBenchesBefore != 0 || craft.WorkBenchesAfter != 1 ||
+            client.PlacementRequests != 1 || tasks.Any(task => task.Status != "success"))
+            throw new InvalidOperationException("offline_boundary_failed:exact_consumption_then_late_wood_pickup");
+        results.Add(new { Check = "exact_consumption_then_late_wood_pickup", Status = "pass_synthetic_offline",
+            Reason = "26_to_16_exact_witness_then_27_and_35_pickup;one_craft;placement_verified",
+            client.LateExactSamples, client.LateGainSamples, client.CraftRequests, client.PlacementRequests,
+            craft.WoodBefore, craft.WoodAfter, craft.WorkBenchesBefore, craft.WorkBenchesAfter });
     }
 
     private static void CheckPartialPickup(List<object> results)
@@ -60,7 +91,9 @@ internal static class Program
         if (caught == null || !failureCheck(caught) || !actionCheck(client))
             throw new InvalidOperationException("offline_boundary_failed:" + name + ":" + (caught == null ? "unexpected_success" : caught.Message));
         results.Add(new { Check = name, Status = "pass_synthetic_offline", Reason = caught.Message,
-            client.Actions, client.GameplayActions, client.UseActions, client.UseAfterHidden });
+            client.Actions, client.GameplayActions, client.UseActions, client.UseAfterHidden,
+            client.DamageSamples, client.LastHealth, client.UnsafeUiSamples, client.GameplayAfterUnsafe,
+            client.CraftRequests, client.PlacementRequests });
     }
 
     private sealed class FakeClient : IStageBClient
@@ -81,31 +114,46 @@ internal static class Program
         public long CraftSequence;
         public int CraftRequests;
         public int PlacementRequests;
+        public int LateExactSamples;
+        public int LateGainSamples;
+        public int DamageSamples, LastHealth, UnsafeUiSamples, GameplayAfterUnsafe;
+        private bool _unsafeObserved;
         private int _deliveredWood;
         private int _selectedSlot = 2;
         private bool _crafted;
         private bool _placed;
+        private int _postCraftSamples;
         public FakeClient(string mode) { _mode = mode; }
 
         public OwnObservation Observe()
         {
             if (_mode != "stale" || _sequence == 0) ++_sequence;
             if (_mode == "hidden" && UseActions >= 2) Hidden = true;
-            _last = _mode == "partial_pickup" ? PartialPickupSample() : Sample(_sequence, "Agent", Hidden, _input);
+            _last = PickupMode ? PartialPickupSample() : Sample(_sequence, "Agent", Hidden, _input);
+            if (_mode == "damage_twenty" && UseActions > 0)
+            { _last.Health = 80; ++DamageSamples; _unsafeObserved = true; }
+            if ((_mode == "paused" || _mode == "options_open") && UseActions > 0)
+            {
+                _last.GamePaused = _mode == "paused"; _last.OptionsOpen = _mode == "options_open";
+                ++UnsafeUiSamples; _unsafeObserved = true;
+            }
+            LastHealth = _last.Health;
             return _last;
         }
 
         public OwnObservation Act(OwnObservation observation, InputState input)
         {
             ++Actions;
-            if (input.Left || input.Right || input.Jump || input.UseItem || input.SelectedSlot >= 0 || input.CraftWorkBench) ++GameplayActions;
+            bool gameplay = input.Left || input.Right || input.Jump || input.UseItem || input.SelectedSlot >= 0 ||
+                input.CraftWorkBench || input.CraftRecipe != null;
+            if (gameplay) { ++GameplayActions; if (_unsafeObserved) ++GameplayAfterUnsafe; }
             if (input.UseItem)
             {
                 ++UseActions;
                 if (Hidden) ++UseAfterHidden;
             }
             _input = input.Copy();
-            if (_mode == "partial_pickup")
+            if (PickupMode)
             {
                 if (input.SelectedSlot >= 0) _selectedSlot = input.SelectedSlot;
                 if (input.CraftWorkBench)
@@ -133,12 +181,15 @@ internal static class Program
             return _last;
         }
 
+        private bool PickupMode { get { return _mode == "partial_pickup" || _mode == "late_pickup" || _mode == "masked_craft"; } }
+
         private OwnObservation PartialPickupSample()
         {
             bool gone = UseActions >= 2;
             if (gone && !_crafted)
             {
-                if (PartialWoodSamples < 4) { _deliveredWood = 6; ++PartialWoodSamples; }
+                if (_mode != "partial_pickup") _deliveredWood = 26;
+                else if (PartialWoodSamples < 4) { _deliveredWood = 6; ++PartialWoodSamples; }
                 else
                 {
                     _deliveredWood = 10;
@@ -149,6 +200,16 @@ internal static class Program
             OwnObservation sample = Sample(_sequence, "Agent", gone, _input);
             GameplayObservation gameplay = sample.Gameplay;
             gameplay.Wood = _deliveredWood - (_crafted ? 10 : 0);
+            if (_crafted && _mode != "partial_pickup")
+            {
+                ++_postCraftSamples;
+                if (_mode == "late_pickup" && _postCraftSamples == 1) ++LateExactSamples;
+                else
+                {
+                    gameplay.Wood += _mode == "late_pickup" && _postCraftSamples == 2 ? 11 : 19;
+                    ++LateGainSamples;
+                }
+            }
             gameplay.WorkBenches = _crafted && !_placed ? 1 : 0;
             gameplay.WorkBenchSlot = _crafted && !_placed ? 3 : -1;
             gameplay.SelectedSlot = _selectedSlot;

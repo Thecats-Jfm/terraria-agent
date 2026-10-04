@@ -50,12 +50,18 @@ namespace TerrariaAgent.Bridge
         private static string _pendingArmSessionId;
         private static long _pendingArmControlEpoch;
         private static long _pendingArmStopFileStamp;
+        private static int _pendingArmHumanActivityRevision;
         private static bool _pendingArmFromWindow;
         private static string _lastPendingReleaseSummary;
         private static bool _permitContextUnsafe = true;
         private static WinForms.Form _gameForm;
         private static GameWindowMessageFilter _gameMessageFilter;
         private static WindowArmSignal _windowArmSignal;
+        // Kept separately from ordinary pending arms: our own options pause is
+        // expected to make RefreshContext clear ordinary input permissions.
+        private static WindowArmSignal _windowResumeArmSignal;
+        private static WindowArmSignal _resumingArmSignal;
+        private static WindowArmSignal _resumePauseRecoverySignal;
         private static int _windowInsertHeld;
         private static int _windowBackHeld;
         private static int _windowHomeHeld;
@@ -74,16 +80,21 @@ namespace TerrariaAgent.Bridge
         private static int _physicalMouseX;
         private static int _physicalMouseY;
         private static bool _mouseInjected;
+        private static AutoPausePolicy _autoPause;
+        private static int _humanActivityRevision;
 
         public static void Initialize(string runtimeRoot, string saveRoot, string runDirectory, string runId, string token,
             bool allowInitialControllerStart, bool enableStageB)
         {
             _stageBEnabled = enableStageB;
+            _autoPause = new AutoPausePolicy(enableStageB);
             Gate = new LeaseGate(null, allowInitialControllerStart, enableStageB);
             _runtimeRoot = runtimeRoot;
             _saveRoot = saveRoot;
             _runDirectory = runDirectory;
-            _log = new EventLog(runDirectory, runId);
+            string challenge = Path.GetFileName(saveRoot);
+            if (challenge != "main" && challenge != "combat_test") throw new InvalidOperationException("Unknown challenge save profile.");
+            _log = new EventLog(runDirectory, runId, challenge);
             _harmony = new Harmony("terraria-agent.stage-a");
             SaveIsolation.Install(_harmony, saveRoot, Diagnostic);
             SaveIsolation.AssertIsolation();
@@ -94,7 +105,7 @@ namespace TerrariaAgent.Bridge
             Main.OnEnginePreload += InstallInputHooks;
             _server = new LocalBridgeServer(Gate, token, runId, runDirectory, Diagnostic, TryInitialOperatorArm);
             int port = _server.Start();
-            var info = new ConnectionInfo { Port = port, Token = token, RunId = runId, LogDirectory = runDirectory };
+            var info = new ConnectionInfo { Port = port, Token = token, RunId = runId, LogDirectory = runDirectory, Challenge = challenge };
             string ipcDirectory = Path.Combine(runtimeRoot, "ipc");
             Directory.CreateDirectory(ipcDirectory);
             _connectionPath = Path.Combine(ipcDirectory, runId + ".local.json");
@@ -147,13 +158,26 @@ namespace TerrariaAgent.Bridge
             internal readonly string SessionId;
             internal readonly long ControlEpoch;
             internal readonly long StopFileStamp;
-            internal WindowArmSignal(long observedAtMs, LeaseSnapshot lease, long stopFileStamp)
+            internal readonly int HumanActivityRevision;
+            internal readonly bool ResumeStarted;
+            internal WindowArmSignal(long observedAtMs, LeaseSnapshot lease, long stopFileStamp, int humanActivityRevision)
             {
                 ObservedAtMs = observedAtMs;
                 WorldId = lease.WorldId;
                 SessionId = lease.SessionId;
                 ControlEpoch = lease.ControlEpoch;
                 StopFileStamp = stopFileStamp;
+                HumanActivityRevision = humanActivityRevision;
+            }
+            internal WindowArmSignal(WindowArmSignal signal)
+            {
+                ObservedAtMs = signal.ObservedAtMs;
+                WorldId = signal.WorldId;
+                SessionId = signal.SessionId;
+                ControlEpoch = signal.ControlEpoch;
+                StopFileStamp = signal.StopFileStamp;
+                HumanActivityRevision = signal.HumanActivityRevision;
+                ResumeStarted = true;
             }
         }
 
@@ -193,6 +217,19 @@ namespace TerrariaAgent.Bridge
             public bool PreFilterMessage(ref WinForms.Message message)
             {
                 if (message.HWnd != _handle) return false;
+                // Own-window physical clicks cancel an unattended pause, too.
+                // Internal Main.mouseX/Y aiming never creates Windows messages.
+                if (message.Msg == 0x0201 || message.Msg == 0x0204 || message.Msg == 0x0207 ||
+                    message.Msg == 0x020B || message.Msg == 0x020A || message.Msg == 0x020E)
+                {
+                    Interlocked.Increment(ref _humanActivityRevision);
+                    Interlocked.Exchange(ref _windowResumeArmSignal, null);
+                    LeaseSnapshot before = Gate.Snapshot();
+                    Gate.ManualTakeover("physical_window_pointer");
+                    if (before.State == ControlState.Agent || before.ArmPermitted)
+                        Interlocked.Increment(ref _windowManualEvents);
+                    return false;
+                }
                 bool down = message.Msg == 0x0100 || message.Msg == 0x0104; // WM_KEYDOWN / WM_SYSKEYDOWN
                 bool up = message.Msg == 0x0101 || message.Msg == 0x0105; // WM_KEYUP / WM_SYSKEYUP
                 if (!down && !up) return false;
@@ -226,6 +263,8 @@ namespace TerrariaAgent.Bridge
                     {
                         if (firstDown)
                         {
+                            Interlocked.Increment(ref _humanActivityRevision);
+                            Interlocked.Exchange(ref _windowResumeArmSignal, null);
                             LeaseSnapshot lease = Gate.Snapshot();
                             Interlocked.Exchange(ref _windowArmSignal, null);
                             Interlocked.Exchange(ref _windowCancelArm, 1);
@@ -239,13 +278,17 @@ namespace TerrariaAgent.Bridge
                 if (args.KeyCode == WinForms.Keys.Insert)
                 {
                     bool firstDown = Interlocked.Exchange(ref _windowInsertHeld, 1) == 0;
-                    if (args.Control && args.Shift)
+                    if (args.Control && args.Shift && !args.Alt)
                     {
                         if (firstDown)
                         {
+                            int revision = Interlocked.Increment(ref _humanActivityRevision);
                             LeaseSnapshot lease = Gate.Snapshot();
+                            Interlocked.Exchange(ref _windowArmSignal, null);
+                            Interlocked.Exchange(ref _windowCancelArm, 1);
                             if (lease.Connected)
-                                Interlocked.Exchange(ref _windowArmSignal, new WindowArmSignal(MonotonicClock.NowMs, lease, Interlocked.Read(ref _stopFileStamp)));
+                                Interlocked.Exchange(ref _windowResumeArmSignal, new WindowArmSignal(MonotonicClock.NowMs, lease,
+                                    Interlocked.Read(ref _stopFileStamp), revision));
                         }
                         return; // Autorepeat cannot create another permission.
                     }
@@ -257,6 +300,8 @@ namespace TerrariaAgent.Bridge
                     {
                         if (firstDown)
                         {
+                            Interlocked.Increment(ref _humanActivityRevision);
+                            Interlocked.Exchange(ref _windowResumeArmSignal, null);
                             Interlocked.Exchange(ref _windowArmSignal, null);
                             Interlocked.Exchange(ref _windowCancelArm, 1);
                             Gate.EmergencyStop("emergency_window_hotkey");
@@ -268,12 +313,14 @@ namespace TerrariaAgent.Bridge
                 bool otherKey = !IsWindowArmKey(args.KeyCode);
                 if (otherKey)
                 {
+                    Interlocked.Exchange(ref _windowResumeArmSignal, null);
                     Interlocked.Exchange(ref _windowArmSignal, null);
                     Interlocked.Exchange(ref _windowCancelArm, 1);
                 }
                 LeaseSnapshot currentLease = Gate.Snapshot();
                 if (otherKey || currentLease.State == ControlState.Agent || currentLease.ArmPermitted)
                 {
+                    Interlocked.Increment(ref _humanActivityRevision);
                     Gate.ManualTakeover("physical_window_key");
                     if (currentLease.State == ControlState.Agent || currentLease.ArmPermitted)
                         Interlocked.Increment(ref _windowManualEvents);
@@ -312,8 +359,16 @@ namespace TerrariaAgent.Bridge
             _pendingArmSessionId = null;
             _pendingArmControlEpoch = 0;
             _pendingArmStopFileStamp = 0;
+            _pendingArmHumanActivityRevision = 0;
             _pendingArmFromWindow = false;
             _lastPendingReleaseSummary = null;
+        }
+
+        private static void ClearResumeArm()
+        {
+            Interlocked.Exchange(ref _windowResumeArmSignal, null);
+            _resumingArmSignal = null;
+            _resumePauseRecoverySignal = null;
         }
 
         private static void DrainWindowControlEvents()
@@ -402,6 +457,152 @@ namespace TerrariaAgent.Bridge
                 ";inventoryOpen=" + Main.playerInventory + ";control=stopped_no_arm");
         }
 
+        private static bool ResumeArmMatches(WindowArmSignal signal, LeaseSnapshot lease)
+        {
+            long age = MonotonicClock.NowMs - signal.ObservedAtMs;
+            return age >= 0 && age <= 500 && !_bridgeFaulted && lease.Connected && !lease.ArmPermitted &&
+                (lease.State == ControlState.Manual || lease.State == ControlState.LatchedStop) &&
+                !string.IsNullOrEmpty(signal.WorldId) && signal.WorldId == _worldId && signal.WorldId == lease.WorldId &&
+                signal.SessionId == lease.SessionId && signal.ControlEpoch == lease.ControlEpoch &&
+                signal.HumanActivityRevision == Volatile.Read(ref _humanActivityRevision) &&
+                signal.StopFileStamp == Interlocked.Read(ref _stopFileStamp) &&
+                object.ReferenceEquals(_worldReference, Main.ActiveWorldFileData);
+        }
+
+        private static bool ResumeArmWorldSafe(Player player)
+        {
+            return !_bridgeFaulted && Main.netMode == 0 && !Main.gameMenu && player != null && player.active &&
+                !player.dead && player.statLife > 0 && !player.ghost && player.spectating < 0 &&
+                !player.isOperatingAnotherEntity && !player.isControlledByFilm && !TextInputActive() &&
+                !Main.playerInventory && !Main.mapFullscreen && player.chest < 0 &&
+                FocusHelper.IsSelectedApplication && Main.instance != null && Main.instance.IsActive &&
+                (!_stageBEnabled || (!PlayerInput.UsingGamepad && !Main.SmartCursorWanted && player.gravDir == 1f));
+        }
+
+        private static void DrainResumeArm()
+        {
+            WindowArmSignal incoming = Interlocked.Exchange(ref _windowResumeArmSignal, null);
+            if (incoming != null) _resumingArmSignal = incoming;
+            WindowArmSignal signal = _resumingArmSignal;
+            if (signal == null) return;
+            Player player = LocalPlayer();
+            LeaseSnapshot lease = Gate.Snapshot();
+            if (!ResumeArmMatches(signal, lease) || !ResumeArmWorldSafe(player))
+            {
+                _resumingArmSignal = null;
+                Diagnostic("operator_resume_arm", "rejected_context_or_stale_gesture;control_remains_stopped=True");
+                return;
+            }
+            KeyboardState keys = Keyboard.GetState();
+            Keys[] pressed = keys.GetPressedKeys();
+            foreach (Keys key in pressed)
+                if (key != Keys.LeftControl && key != Keys.RightControl && key != Keys.LeftShift && key != Keys.RightShift && key != Keys.Insert)
+                {
+                    _resumingArmSignal = null;
+                    Interlocked.Increment(ref _humanActivityRevision);
+                    Gate.ManualTakeover("physical_keyboard_input");
+                    return;
+                }
+            if (Main.ingameOptionsWindow)
+            {
+                if (signal.ResumeStarted || _operatorPauseWorldId != signal.WorldId)
+                {
+                    _resumingArmSignal = null;
+                    Diagnostic("operator_resume_arm", "rejected_no_owned_options;control_remains_stopped=True");
+                    return;
+                }
+                // Keep the player paused until this one complete gesture has
+                // been released. Autorepeat cannot refresh its original deadline.
+                if (pressed.Length != 0 || Volatile.Read(ref _windowInsertHeld) != 0 ||
+                    Volatile.Read(ref _windowBackHeld) != 0 || !Main.gamePaused) return;
+                using (FileStream guard = TryAcquireStopFileLock())
+                {
+                    if (guard == null) { _resumingArmSignal = null; return; }
+                    string flag = Path.Combine(_runtimeRoot, "STOP");
+                    bool stopChanged = File.Exists(flag) && File.GetLastWriteTimeUtc(flag).Ticks != signal.StopFileStamp;
+                    if (stopChanged || !ResumeArmMatches(signal, Gate.Snapshot()) || !ResumeArmWorldSafe(player))
+                    {
+                        _resumingArmSignal = null;
+                        if (stopChanged) Gate.EmergencyStop("stop_file");
+                        Diagnostic("operator_resume_arm", "rejected_before_normal_close;control_remains_stopped=True");
+                        return;
+                    }
+                }
+                // UI/audio work must not hold STOP.lock: the watchdog uses the
+                // same nonblocking lock and would correctly fail closed on busy.
+                // Closing a normal menu grants no control; the eventual permit
+                // still holds STOP.lock throughout its separate transaction.
+                if (!ResumeArmMatches(signal, Gate.Snapshot()) || !ResumeArmWorldSafe(player) ||
+                    !Main.ingameOptionsWindow || _operatorPauseWorldId != signal.WorldId)
+                { _resumingArmSignal = null; return; }
+                ClearPendingArm();
+                ClearPreviousInjection();
+                IngameOptions.Close();
+                if (Main.ingameOptionsWindow)
+                {
+                    _resumingArmSignal = null;
+                    Diagnostic("operator_resume_arm", "normal_close_did_not_close_options;control_remains_stopped=True");
+                    return;
+                }
+                _operatorPauseWorldId = null;
+                // Our owned options were opened only from an empty gameplay
+                // UI. Close() creates this inventory; close it normally too.
+                if (Main.playerInventory) player.ToggleInv();
+                _resumingArmSignal = new WindowArmSignal(signal);
+                _resumePauseRecoverySignal = _resumingArmSignal;
+                Diagnostic("operator_resume_arm", "normal_options_close;waiting_for_safe_context=True;automaticArm=False");
+                return; // Let vanilla recalculate gamePaused before permitting.
+            }
+            if (Main.gamePaused)
+            {
+                if (!signal.ResumeStarted)
+                {
+                    _resumingArmSignal = null;
+                    Diagnostic("operator_resume_arm", "rejected_unknown_pause;control_remains_stopped=True");
+                }
+                return;
+            }
+            // Ordinary unpaused Insert uses the original released/PermitNextArm
+            // path, too. No session, gesture timestamp or epoch is renewed here.
+            if (!OrdinaryPlayer(player)) { _resumingArmSignal = null; return; }
+            _resumingArmSignal = null;
+            Interlocked.Exchange(ref _windowArmSignal, signal);
+        }
+
+        private static void PauseAfterFailedResumeArm()
+        {
+            WindowArmSignal signal = _resumePauseRecoverySignal;
+            if (signal == null) return;
+            LeaseSnapshot lease = Gate.Snapshot();
+            Player player = LocalPlayer();
+            long age = MonotonicClock.NowMs - signal.ObservedAtMs;
+            // This proof comes only from a real, owned options close. Never
+            // protect an ordinary unarmed observer by taking over their UI.
+            bool sameOwner = signal.SessionId == lease.SessionId && signal.WorldId == lease.WorldId &&
+                signal.WorldId == _worldId && object.ReferenceEquals(_worldReference, Main.ActiveWorldFileData);
+            if (!sameOwner || signal.HumanActivityRevision != Volatile.Read(ref _humanActivityRevision) ||
+                age < 0 || _bridgeFaulted || !ResumeArmWorldSafe(player) || lease.ControlEpoch < signal.ControlEpoch ||
+                lease.State == ControlState.Agent || Main.ingameOptionsWindow)
+            { _resumePauseRecoverySignal = null; return; }
+            // Until the original deadline, wait for the explicit controller arm.
+            // A stop/failed grant is visible as a newer epoch without permission.
+            bool failed = lease.State == ControlState.LatchedStop && !lease.ArmPermitted &&
+                lease.ControlEpoch > signal.ControlEpoch;
+            if (!failed && age <= 500) return;
+            _resumePauseRecoverySignal = null; // One normal UI attempt; no retry.
+            ClearPendingArm();
+            Interlocked.Exchange(ref _windowResumeArmSignal, null);
+            _resumingArmSignal = null;
+            if (lease.ArmPermitted) Gate.EmergencyStop("resume_arm_handoff_timeout");
+            ClearPreviousInjection();
+            // Vanilla remains responsible for gamePaused. All identity, focus,
+            // ordinary-player and empty-UI checks were made on this game thread.
+            IngameOptions.Open();
+            if (Main.ingameOptionsWindow) _operatorPauseWorldId = _worldId;
+            Diagnostic("operator_resume_arm", "normal_options_reopen;optionsOpen=" + Main.ingameOptionsWindow +
+                ";reason=" + (failed ? "handoff_failed" : "handoff_timeout") + ";automaticArm=False");
+        }
+
         // Only protocol state and a workspace stop flag are touched by this timer.
         // Player fields are cleared on the next executable game update.
         private static void Watchdog(object unused)
@@ -473,7 +674,10 @@ namespace TerrariaAgent.Bridge
                 // Clears last tick's injection BEFORE vanilla rebuilds physical
                 // controls. Human controls will then be copied normally by the game.
                 ClearPreviousInjection();
+                PauseAfterControllerStop();
                 DrainWindowPauseEvents();
+                DrainResumeArm();
+                PauseAfterFailedResumeArm();
             }
             catch (Exception error) { FailClosed(error); }
         }
@@ -488,36 +692,60 @@ namespace TerrariaAgent.Bridge
                 // CopyInto also occurs in dead/chat/menu paths. Recheck immediately
                 // here because WritingText is reset during PlayerInput.UpdateInput.
                 RefreshContext();
-                HandleHotkeys();
                 var lease = Gate.Snapshot();
-                if (!OrdinaryPlayer(__0)) return;
                 // These are vanilla's freshly copied physical controls, before our
                 // injection. This also detects gamepad movement/jump without any
                 // background polling or logging of physical key/button values.
-                if ((lease.State == ControlState.Agent || lease.ArmPermitted) &&
-                    (__0.controlLeft || __0.controlRight || __0.controlJump || (_stageBEnabled && (__0.controlUseItem || __0.controlUseTile))))
+                if (__0.controlLeft || __0.controlRight || __0.controlJump || __0.controlUp || __0.controlUseItem || __0.controlUseTile)
                 {
-                    bool left = __0.controlLeft, right = __0.controlRight, jump = __0.controlJump;
+                    bool left = __0.controlLeft, right = __0.controlRight, jump = __0.controlJump, up = __0.controlUp;
                     bool useItem = __0.controlUseItem, useTile = __0.controlUseTile;
-                    ++_takeovers;
+                    Interlocked.Increment(ref _humanActivityRevision);
+                    ClearResumeArm();
+                    ClearPendingArm();
                     string takeoverReason = _stageBEnabled ? "physical_gameplay_input" : "physical_movement_or_jump";
                     Gate.ManualTakeover(takeoverReason);
                     ClearPreviousInjection();
                     __0.controlLeft = left; __0.controlRight = right; __0.controlJump = jump;
+                    __0.controlUp = up;
                     __0.controlUseItem = useItem; __0.controlUseTile = useTile;
-                    Diagnostic("manual_takeover", takeoverReason + ";count=" + _takeovers);
+                    if (lease.State == ControlState.Agent || lease.ArmPermitted)
+                    {
+                        ++_takeovers;
+                        Diagnostic("manual_takeover", takeoverReason + ";count=" + _takeovers);
+                    }
                     return;
                 }
+                HandleHotkeys();
+                lease = Gate.Snapshot();
+                if (!OrdinaryPlayer(__0)) return;
                 if (lease.State != ControlState.Agent) return;
                 // A single atomic snapshot binds input, sequence and lease expiry.
                 // Mixing PollInputs with an older snapshot could duplicate crafts.
                 InputState input = lease.Inputs;
+                if (input.Up)
+                {
+                    // All reads run on the game thread. A transport observation
+                    // or an older controller proof cannot authorize this update.
+                    InputState resolved;
+                    if (!_stageBEnabled || !NormalPlatformUpPlayer(__0) ||
+                        !PlatformStepGuard.TryResolve(input, VisibleEnvironment.Capture(__0), out resolved))
+                    {
+                        Gate.EmergencyStop("platform_up_route_not_legally_verified");
+                        ClearPreviousInjection();
+                        return;
+                    }
+                    // Fresh normal ground after ascent needs only Left/Right.
+                    // Keep the original lease/epoch; never extend or rearm it.
+                    input = resolved;
+                }
                 var currentLease = Gate.Snapshot();
                 if (currentLease.State != ControlState.Agent || currentLease.LastSequence != lease.LastSequence ||
                     currentLease.ControlEpoch != lease.ControlEpoch) return;
                 __0.controlLeft = input.Left;
                 __0.controlRight = input.Right;
                 __0.controlJump = input.Jump;
+                __0.controlUp = input.Up;
                 _lastInjectedPlayer = __0;
                 _injected = true;
                 _lastAppliedLeaseExpiry = lease.ExpiresAtMs;
@@ -526,7 +754,7 @@ namespace TerrariaAgent.Bridge
                 {
                     if (!_mouseInjected) { _physicalMouseX = Main.mouseX; _physicalMouseY = Main.mouseY; }
                     __0.controlUseItem = false;
-                    if (input.CraftWorkBench)
+                    if (input.CraftWorkBench || input.CraftRecipe != null)
                     {
                         using (FileStream guard = TryAcquireStopFileLock())
                         {
@@ -535,10 +763,12 @@ namespace TerrariaAgent.Bridge
                             { Gate.EmergencyStop("stop_file"); ClearPreviousInjection(); return; }
                             string executionReason;
                             Gate.TryExecuteCurrent(lease.SessionId, lease.WorldId, lease.LastSequence,
-                                () => GameplayActions.Apply(__0, input, lease, Gate, Diagnostic), out executionReason);
+                                () => GameplayActions.Apply(__0, input, lease, Gate, Diagnostic,
+                                    turn => TryCommitNormalTurn(lease, turn)), out executionReason);
                         }
                     }
-                    else GameplayActions.Apply(__0, input, lease, Gate, Diagnostic);
+                    else GameplayActions.Apply(__0, input, lease, Gate, Diagnostic,
+                        turn => TryCommitNormalTurn(lease, turn));
                     _mouseInjected = input.UseItem;
                     if (Gate.Snapshot().State != ControlState.Agent) ClearPreviousInjection();
                 }
@@ -550,6 +780,56 @@ namespace TerrariaAgent.Bridge
                 Diagnostic("gameplay_failure", error.Message);
             }
             catch (Exception error) { FailClosed(error); }
+        }
+
+        private static bool TryCommitNormalTurn(LeaseSnapshot lease, Action turn)
+        {
+            // Capture/aim filtering runs outside this short commit lock. A
+            // concurrent STOP or expired/revoked action cannot commit a turn.
+            using (FileStream guard = TryAcquireStopFileLock())
+            {
+                if (guard == null) { Gate.EmergencyStop("stop_file_lock_busy"); return false; }
+                if (File.Exists(Path.Combine(_runtimeRoot, "STOP")))
+                { Gate.EmergencyStop("stop_file"); return false; }
+                string reason;
+                return Gate.TryExecuteCurrent(lease.SessionId, lease.WorldId, lease.LastSequence, turn, out reason);
+            }
+        }
+
+        private static void PauseAfterControllerStop()
+        {
+            Player player = LocalPlayer();
+            LeaseSnapshot before = Gate.Snapshot();
+            var context = new AutoPauseContext
+            {
+                WorldId = _worldId, SinglePlayer = Main.netMode == 0,
+                Menu = Main.gameMenu || player == null || !player.active,
+                Dead = player != null && player.dead,
+                PlayerAlive = player != null && player.active && !player.dead && player.statLife > 0,
+                Health = player != null && player.active ? player.statLife : 0,
+                OrdinaryPlayer = OrdinaryPlayer(player), TextInput = TextInputActive(), Faulted = _bridgeFaulted,
+                Focused = FocusHelper.IsSelectedApplication && Main.instance != null && Main.instance.IsActive,
+                OtherUiOpen = Main.playerInventory || Main.mapFullscreen || (player != null && player.chest >= 0),
+                GamePaused = Main.gamePaused, OptionsOpen = Main.ingameOptionsWindow,
+                HumanActivityRevision = Volatile.Read(ref _humanActivityRevision)
+            };
+            string reason;
+            if (_autoPause == null || !_autoPause.ShouldPause(before, context, MonotonicClock.NowMs, out reason)) return;
+            LeaseSnapshot current = Gate.Snapshot();
+            bool same = current.State == ControlState.LatchedStop && !current.ArmPermitted &&
+                current.ControlEpoch == before.ControlEpoch &&
+                current.SessionId == before.SessionId && current.WorldId == before.WorldId &&
+                object.ReferenceEquals(_worldReference, Main.ActiveWorldFileData) &&
+                context.HumanActivityRevision == Volatile.Read(ref _humanActivityRevision);
+            if (!same || !OrdinaryPlayer(player) || Main.instance == null || !Main.instance.IsActive ||
+                player.statLife <= 0 || Main.playerInventory || player.chest >= 0)
+            { Diagnostic("automatic_pause_ui", "rejected_after_policy;reason=" + reason); return; }
+            ClearPendingArm();
+            ClearPreviousInjection();
+            IngameOptions.Open();
+            if (Main.ingameOptionsWindow) _operatorPauseWorldId = _worldId;
+            Diagnostic("automatic_pause_ui", "normal_options_open;optionsOpen=" + Main.ingameOptionsWindow +
+                ";reason=" + reason + ";control_remains=" + current.State + ";stopReason=" + current.Reason);
         }
 
         private static void GameUpdatePostfix()
@@ -583,18 +863,24 @@ namespace TerrariaAgent.Bridge
                     ControlState = lease.State.ToString(), Reason = lease.Reason,
                     CanArm = lease.ArmPermitted, CanOperatorArm = lease.CanOperatorArm, LeaseInputs = lease.Inputs,
                     Inputs = new InputState { Left = !menu && player.controlLeft, Right = !menu && player.controlRight,
-                        Jump = !menu && player.controlJump, UseItem = !menu && player.controlUseItem },
+                        Jump = !menu && player.controlJump, Up = !menu && player.controlUp, UseItem = !menu && player.controlUseItem },
                     GameTick = _gameTick, MonotonicMs = now,
-                    GamePaused = Main.gamePaused, OptionsOpen = Main.ingameOptionsWindow
+                    GamePaused = Main.gamePaused, OptionsOpen = Main.ingameOptionsWindow,
+                    Facing = menu ? 0 : player.direction, ItemAnimation = menu ? 0 : player.itemAnimation
                 };
                 if (_stageBEnabled && !menu && !player.dead)
                 {
                     observation.Gameplay = VisibleEnvironment.Capture(player);
-                    observation.Gameplay.CanCraftWorkBench = GameplayActions.CanCraftWorkBench(player);
+                    observation.Gameplay.CanCraftRecipes = GameplayActions.CanCraftRecipes(player);
+                    observation.Gameplay.CanCraftWorkBench = Array.IndexOf(observation.Gameplay.CanCraftRecipes, GameplayRecipeIds.WorkBench) >= 0;
                 }
                 Gate.RecordObservation(observation.Sequence, now);
                 _server.Publish(observation);
-                if (now - _lastLogAt >= 200)
+                // Controllers retain each skill's action/result samples. Keep
+                // overnight idle/resource snapshots bounded; critical events
+                // (death, input release, craft and control changes) are immediate.
+                long logPeriod = menu ? 5000 : observation.GamePaused || _stageBEnabled ? 1000 : 200;
+                if (now - _lastLogAt >= logPeriod)
                 {
                     _lastLogAt = now;
                     if (!_log.Record("observation", "own_state", observation)) Gate.EmergencyStop("log_backpressure_or_budget");
@@ -622,6 +908,7 @@ namespace TerrariaAgent.Bridge
             bool worldChanged = !object.ReferenceEquals(reference, _worldReference);
             if (worldChanged)
             {
+                ClearResumeArm();
                 Interlocked.Exchange(ref _windowPauseEvents, null);
                 _operatorPauseWorldId = null;
                 if (_stageBEnabled) VisibleEnvironment.ClearHistory();
@@ -632,9 +919,18 @@ namespace TerrariaAgent.Bridge
             bool dead = !menu && player.dead;
             if (dead || menu || _bridgeFaulted)
             {
+                ClearResumeArm();
                 Interlocked.Exchange(ref _windowPauseEvents, null);
                 _operatorPauseWorldId = null;
             }
+            // A paused own-options view is the only expected unsafe context for
+            // the independent resume queue. Genuine focus/input/UI transitions
+            // revoke it even when options already make Gate's context unsafe.
+            if (!menu && (!FocusHelper.IsSelectedApplication || Main.instance == null || !Main.instance.IsActive ||
+                TextInputActive() || Main.playerInventory || Main.mapFullscreen || player.chest >= 0 ||
+                player.ghost || player.spectating >= 0 || player.isOperatingAnotherEntity || player.isControlledByFilm ||
+                (_stageBEnabled && (PlayerInput.UsingGamepad || Main.SmartCursorWanted || player.gravDir != 1f))))
+                ClearResumeArm();
             if (_operatorPauseWorldId != null && !Main.ingameOptionsWindow) _operatorPauseWorldId = null;
             if (dead && !_previousDead) { ++_deaths; Diagnostic("death", "count=" + _deaths); }
             _previousDead = dead;
@@ -644,6 +940,13 @@ namespace TerrariaAgent.Bridge
             bool contextUnsafe = dead || menu || unsafeInput || _bridgeFaulted;
             bool contextChanged = contextUnsafe != _permitContextUnsafe;
             _permitContextUnsafe = contextUnsafe;
+            if (contextChanged && contextUnsafe && !menu && !dead)
+                Diagnostic("unsafe_context", "textInput=" + TextInputActive() +
+                    ";gamePaused=" + Main.gamePaused + ";map=" + Main.mapFullscreen +
+                    ";options=" + Main.ingameOptionsWindow + ";focus=" + FocusHelper.IsSelectedApplication +
+                    ";ordinaryPlayer=" + OrdinaryPlayer(player) + ";gamepad=" + PlayerInput.UsingGamepad +
+                    ";smartCursor=" + Main.SmartCursorWanted + ";gravity=" + (player == null ? 0 : player.gravDir) +
+                    ";bridgeFaulted=" + _bridgeFaulted);
             if (worldChanged || contextChanged || contextUnsafe)
             {
                 if (_pendingArmChord)
@@ -696,6 +999,16 @@ namespace TerrariaAgent.Bridge
                 Main.CurrentInputTextTakerOverride != null;
         }
 
+        private static bool NormalPlatformUpPlayer(Player player)
+        {
+            // Up also operates mounts, ropes and gravity equipment in vanilla.
+            // This narrow route admits only ordinary unconfused ground walking.
+            return OrdinaryPlayer(player) && player.gravDir == 1f && !player.gravControl && !player.gravControl2 &&
+                !player.confused && !player.shimmering && !player.pulley && player.mount != null && !player.mount.Active &&
+                player.grapCount == 0 && player.grappling != null && player.grappling.Length > 0 &&
+                player.grappling[0] == -1 && !player.IsRidingTracks;
+        }
+
         private static void HandleHotkeys()
         {
             if (!FocusHelper.IsSelectedApplication) return;
@@ -713,7 +1026,8 @@ namespace TerrariaAgent.Bridge
                 bool sameWorld = !string.IsNullOrEmpty(signal.WorldId) && string.Equals(signal.WorldId, lease.WorldId, StringComparison.Ordinal);
                 bool sameOwner = lease.Connected && string.Equals(signal.SessionId, lease.SessionId, StringComparison.Ordinal);
                 bool sameEpoch = signal.ControlEpoch == lease.ControlEpoch;
-                bool eligible = age >= 0 && age <= 500 && sameWorld && sameOwner && sameEpoch && !_bridgeFaulted && OrdinaryPlayer(LocalPlayer());
+                bool sameHumanRevision = signal.HumanActivityRevision == Volatile.Read(ref _humanActivityRevision);
+                bool eligible = age >= 0 && age <= 500 && sameWorld && sameOwner && sameEpoch && sameHumanRevision && !_bridgeFaulted && OrdinaryPlayer(LocalPlayer());
                 Diagnostic("arm_chord_seen", "armChordSeen=True;windowEvent=True;eligible=" + eligible + ";sameWorld=" + sameWorld + ";sameOwner=" + sameOwner + ";sameEpoch=" + sameEpoch);
                 if (eligible)
                 {
@@ -724,6 +1038,7 @@ namespace TerrariaAgent.Bridge
                     _pendingArmSessionId = signal.SessionId;
                     _pendingArmControlEpoch = signal.ControlEpoch;
                     _pendingArmStopFileStamp = signal.StopFileStamp;
+                    _pendingArmHumanActivityRevision = signal.HumanActivityRevision;
                     _pendingArmFromWindow = true;
                 }
             }
@@ -732,6 +1047,8 @@ namespace TerrariaAgent.Bridge
             bool pollDown = arm && !_previousInsert && Volatile.Read(ref _windowInsertHeld) == 0;
             if (stop && !_previousStop && Volatile.Read(ref _windowBackHeld) == 0)
             {
+                Interlocked.Increment(ref _humanActivityRevision);
+                ClearResumeArm();
                 ClearPendingArm();
                 ++_takeovers;
                 Gate.EmergencyStop("emergency_hotkey");
@@ -740,6 +1057,7 @@ namespace TerrariaAgent.Bridge
             }
             else if (pollDown && !_pendingArmChord && !_bridgeFaulted && OrdinaryPlayer(LocalPlayer()))
             {
+                Interlocked.Increment(ref _humanActivityRevision);
                 LeaseSnapshot lease = Gate.Snapshot();
                 if (lease.Connected)
                 {
@@ -750,6 +1068,7 @@ namespace TerrariaAgent.Bridge
                     _pendingArmSessionId = lease.SessionId;
                     _pendingArmControlEpoch = lease.ControlEpoch;
                     _pendingArmStopFileStamp = Interlocked.Read(ref _stopFileStamp);
+                    _pendingArmHumanActivityRevision = Volatile.Read(ref _humanActivityRevision);
                     _pendingArmFromWindow = false;
                     Diagnostic("arm_chord_seen", "armChordSeen=True;windowEvent=False;eligible=True");
                 }
@@ -761,7 +1080,8 @@ namespace TerrariaAgent.Bridge
                 bool sameWorld = string.Equals(_pendingArmWorldId, lease.WorldId, StringComparison.Ordinal);
                 bool sameOwner = lease.Connected && string.Equals(_pendingArmSessionId, lease.SessionId, StringComparison.Ordinal);
                 bool sameEpoch = _pendingArmControlEpoch == lease.ControlEpoch;
-                if (!sameWorld || !sameOwner || !sameEpoch || age < 0 || age > 500)
+                bool sameHumanRevision = _pendingArmHumanActivityRevision == Volatile.Read(ref _humanActivityRevision);
+                if (!sameWorld || !sameOwner || !sameEpoch || !sameHumanRevision || age < 0 || age > 500)
                 {
                     Diagnostic("arm_chord_cancelled", "sameWorld=" + sameWorld + ";sameOwner=" + sameOwner + ";sameEpoch=" + sameEpoch + ";expired=" + (age < 0 || age > 500));
                     ClearPendingArm();
@@ -815,6 +1135,14 @@ namespace TerrariaAgent.Bridge
                             }
                         }
                     }
+                    if (allowed && _autoPause != null)
+                    {
+                        LeaseSnapshot permitted = Gate.Snapshot();
+                        if (permitted.ArmPermitted && (permitted.State == ControlState.LatchedStop || permitted.State == ControlState.Manual) &&
+                            permitted.ControlEpoch == epoch + 1 && permitted.SessionId == sessionId && permitted.WorldId == worldId)
+                            _autoPause.NoteHumanArmAttempt(sessionId, worldId, permitted.ControlEpoch,
+                                Volatile.Read(ref _humanActivityRevision), MonotonicClock.NowMs);
+                    }
                     Diagnostic("human_arm_permission", (allowed ? "granted_once" : "stale_gesture_or_no_ready_session") + ";windowEvent=" + fromWindow);
                 }
             }
@@ -824,6 +1152,7 @@ namespace TerrariaAgent.Bridge
                     if (key != Keys.LeftControl && key != Keys.RightControl && key != Keys.LeftShift && key != Keys.RightShift && key != Keys.Insert)
                     {
                         Diagnostic("arm_chord_cancelled", "reason=other_polled_keyboard_input;pressedCount=" + pressed.Length);
+                        ClearResumeArm();
                         ClearPendingArm();
                         break;
                     }
@@ -832,6 +1161,8 @@ namespace TerrariaAgent.Bridge
             if (!_pendingArmChord && !arm && !stop && (currentLease.State == ControlState.Agent || currentLease.ArmPermitted) && pressed.Length != 0)
             {
                 ++_takeovers;
+                Interlocked.Increment(ref _humanActivityRevision);
+                ClearResumeArm();
                 Gate.ManualTakeover("physical_keyboard_input");
                 ClearPreviousInjection();
                 Diagnostic("manual_takeover", "physical_keyboard_input;count=" + _takeovers);
@@ -847,6 +1178,7 @@ namespace TerrariaAgent.Bridge
             _lastInjectedPlayer.controlLeft = false;
             _lastInjectedPlayer.controlRight = false;
             _lastInjectedPlayer.controlJump = false;
+            _lastInjectedPlayer.controlUp = false;
             if (_stageBEnabled)
             {
                 _lastInjectedPlayer.controlUseItem = false;
@@ -874,6 +1206,7 @@ namespace TerrariaAgent.Bridge
         private static void FailClosed(Exception error)
         {
             Gate.EmergencyStop("bridge_exception");
+            ClearResumeArm();
             ClearPendingArm();
             ClearPreviousInjection();
             if (!_bridgeFaulted) Diagnostic("failure", error.GetType().Name + ":" + error.Message);
@@ -898,6 +1231,7 @@ namespace TerrariaAgent.Bridge
             Main.OnEnginePreload -= InstallInputHooks;
             Gate.EmergencyStop("shutdown");
             DetachWindowHotkeys();
+            ClearResumeArm();
             ClearPendingArm();
             DrainWindowControlEvents();
             Interlocked.Exchange(ref _windowPauseEvents, null);
