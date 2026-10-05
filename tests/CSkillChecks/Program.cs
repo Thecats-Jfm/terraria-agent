@@ -343,6 +343,25 @@ internal static class Program
         Failure("forage_initial_health_below_sixty_prevents_search", "forage_low_health", "forage-stone",
             failure => failure.Message.Contains("forage_requires_health_60"),
             client => client.MovementActions == 0 && client.UseActions == 0 && client.TorchSelections == 0, results);
+        Failure("forage_crafts_once_then_fresh_holds_and_preserves_gain_at_ground_boundary", "forage_craft_torch", "forage-stone",
+            failure => failure.Message.Contains("no_proven_visible_ground_for_next_step") &&
+                failure.Results.Single(task => task.Skill == "craft_torch").Status == "success" &&
+                failure.Results.Single(task => task.Skill == "craft_torch").ProductAfter == 3 &&
+                failure.Results.All(task => task.Skill != "place_torch") &&
+                failure.Results.All(task => task.Skill != "forage_stone" || task.Status != "success"),
+            client => client.CraftRequests == 1 && client.TorchHeldSamples >= 3 && client.UseActions == 0 &&
+                client.UseBeforeTorchHeld == 0 && client.MovementActions == 0,
+            results);
+        foreach (string scenario in new[] { "forage_torch_missing_material", "forage_torch_full_inventory" })
+            Failure("forage_skips_unqualified_torch_" + scenario, scenario, "forage-stone",
+                failure => failure.Message.Contains("no_proven_visible_ground_for_next_step"),
+                client => client.CraftRequests == 0 && client.UseActions == 0 && client.TorchSelections == 0 &&
+                    client.MovementActions == 0, results);
+        Failure("forage_torch_craft_ack_cannot_unlock_warm_or_place", "forage_torch_ack_only", "forage-stone",
+            failure => failure.Message.Contains("observation_stalled") &&
+                failure.Results.All(task => task.Skill != "craft_torch" || task.Status != "success"),
+            client => client.CraftRequests == 1 && client.InventedAcks == 1 && client.TorchSelections == 0 &&
+                client.UseActions == 0 && client.MovementActions == 0, results);
         foreach (string scenario in new[] { "seek_up_visible_stone", "seek_up_wrong_direction" })
         {
             var client = new FakeClient(scenario);
@@ -465,7 +484,7 @@ internal static class Program
             ++ObserveCalls;
             // A craft ACK advertises completion, while the real sample stream
             // remains frozen at the qualification observation.
-            if (Mode == "craft_ack_only" && CraftRequests > 0) return _last;
+            if ((Mode == "craft_ack_only" || Mode == "forage_torch_ack_only") && CraftRequests > 0) return _last;
             if (Mode == "torch_hold_frozen" && TorchSelections > 0) return _last;
             if (Mode == "seek_up_frozen" && UpActions > 0) return _last;
             ++_sequence;
@@ -504,7 +523,7 @@ internal static class Program
                 if (Mode.StartsWith("torch_", StringComparison.Ordinal) && TorchHeldSamples < 3) ++UseBeforeTorchHeld;
                 if (Mode.StartsWith("forage_", StringComparison.Ordinal))
                 {
-                    if (Mode == "forage_torch_path" && TorchHeldSamples < 3) ++UseBeforeTorchHeld;
+                    if ((Mode == "forage_torch_path" || Mode == "forage_craft_torch") && TorchHeldSamples < 3) ++UseBeforeTorchHeld;
                     if (input.AimTileY == 3)
                     {
                         if (!_forageDug.Add(input.AimTileX)) ++DuplicateSoilPicks;
@@ -528,11 +547,11 @@ internal static class Program
             if (input.SelectedSlot >= 0) _selected = input.SelectedSlot;
             if (Mode.StartsWith("torch_", StringComparison.Ordinal) && input.SelectedSlot == 8 && !input.UseItem)
                 ++TorchSelections;
-            if (Mode == "forage_torch_path" && input.SelectedSlot == 8 && !input.UseItem) ++TorchSelections;
+            if ((Mode == "forage_torch_path" || Mode == "forage_craft_torch") && input.SelectedSlot == 8 && !input.UseItem) ++TorchSelections;
             _input = input.Copy();
             if (Mode == "torch_hold_frozen" && input.SelectedSlot == 8)
             { ++InventedAcks; return Sample(_sequence + 1000, true); }
-            if (Mode == "craft_ack_only" && input.CraftRecipe != null)
+            if ((Mode == "craft_ack_only" || Mode == "forage_torch_ack_only") && input.CraftRecipe != null)
             {
                 ++InventedAcks;
                 return Sample(_sequence + 1000, true);
@@ -821,6 +840,23 @@ internal static class Program
                     g.Enemies=new[] { new VisibleEnemy { Id=7,Kind="slime",TileX=3,TileY=2,X=x+30,Y=33 } };
                 if (DeadlineInjected && Mode == "forage_global_x") x=422;
                 if (DeadlineInjected && Mode == "forage_global_down") y=45;
+            }
+            if (Mode == "forage_craft_torch" || Mode == "forage_torch_missing_material" ||
+                Mode == "forage_torch_full_inventory" || Mode == "forage_torch_ack_only")
+            {
+                // Only real advancing observations can expose crafted torches.
+                // The ACK-only scenario invents the same delta exclusively in
+                // Act while Observe remains frozen; it must never warm/use.
+                bool craftedTorch = CraftRequests > 0 && (Mode == "forage_craft_torch" || invented);
+                g.Wood = craftedTorch ? 19 : 20;
+                g.Gel = craftedTorch || Mode == "forage_torch_missing_material" ? 0 : 1;
+                g.HasFreeSlot = Mode != "forage_torch_full_inventory";
+                g.CanCraftRecipes = new[] { GameplayRecipeIds.Torch };
+                g.Torches = craftedTorch ? 3 : 0;
+                g.TorchSlot = craftedTorch ? 8 : -1;
+                g.CanStepLeft = g.CanStepRight = false;
+                g.DirtTargets = new VisibleTarget[0];
+                if (!invented && craftedTorch && _selected == 8) ++TorchHeldSamples;
             }
             LastHealth = health;
             LastStone = g.Stone;

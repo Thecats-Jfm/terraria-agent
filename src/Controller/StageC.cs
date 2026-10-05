@@ -611,6 +611,19 @@ namespace TerrariaAgent.Controller
                 if (_current.Health < 60) Fail("forage_requires_health_60");
                 _forageStart = _foragePrevious = _current;
                 _forageClock = Stopwatch.StartNew();
+                // One optional normal lighting preparation, inside the global
+                // budget. Missing materials/qualification retain the ordinary
+                // sword path; an attempted craft failure ends this run.
+                // Never retry after an ambiguous acknowledgement or re-enter
+                // this block after a soil/search phase begins.
+                CheckForage();
+                if (_current.Gameplay.Torches == 0 && _current.Gameplay.Wood >= 1 &&
+                    _current.Gameplay.Gel >= 1 && _current.Gameplay.HasFreeSlot &&
+                    CanCraft(GameplayRecipeIds.Torch))
+                {
+                    Craft(GameplayRecipeIds.Torch);
+                    CheckForage();
+                }
                 var dug = new List<VisibleTarget>();
                 while (true)
                 {
