@@ -738,7 +738,19 @@ namespace TerrariaAgent.Bridge
                         return RejectStep(out reason, "body_" + UnsafeBodyCategory(space));
                     }
                 }
-                if (!foundFloor) return RejectStep(out reason, "support_missing_within_16px");
+                if (!foundFloor)
+                {
+                    // Geometry-only suffix: x(hex4), firstY(hex3), lastProbeY(hex3),
+                    // currentFirstX(hex4), currentLastX(hex4), r/l. Total47ASCII.
+                    // This column completed every guarded probe; no new read.
+                    if (x < 0 || x > 0xffff || firstY < 0 || firstY > 0xfff ||
+                        lastProbeY < 0 || lastProbeY > 0xfff || currentFirstX < 0 ||
+                        currentFirstX > 0xffff || currentLastX < 0 || currentLastX > 0xffff)
+                        return RejectStep(out reason, "support_missing_within_16px");
+                    return RejectStep(out reason, string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "support_missing_within_16px_{0:x4}{1:x3}{2:x3}{3:x4}{4:x4}{5}",
+                        x, firstY, lastProbeY, currentFirstX, currentLastX, direction > 0 ? "r" : "l"));
+                }
             }
             if (!currentDirectSupport) return RejectStep(out reason, "no_current_foot_support");
             if (hasUpStep && hasDownStep) return RejectStep(out reason, "mixed_up_down_levels");
